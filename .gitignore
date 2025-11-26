@@ -1,0 +1,6 @@
+# Build directory
+build/
+
+# User-specific files
+.DS_Store
+.vscode/
