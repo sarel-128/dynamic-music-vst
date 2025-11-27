@@ -22,17 +22,62 @@ void SimilarityMatrixComponent::paint(juce::Graphics& g)
     float cellWidth = (float)getWidth() / numCells;
     float cellHeight = (float)getHeight() / numCells;
 
+    // --- Normalize the matrix for full contrast ---
+    float minVal = 1.0f, maxVal = -1.0f;
     for (int i = 0; i < numCells; ++i)
     {
         for (int j = 0; j < numCells; ++j)
         {
-            float value = matrix[i][j]; // Should be in [-1, 1] for correlation
-            // Map value from [-1, 1] to a color. For example, a grayscale.
-            // Or a more complex color map. Let's use a simple grayscale.
-            // Remap [-1, 1] to [0, 1] for color intensity.
-            float intensity = (value + 1.0f) / 2.0f;
-            g.setColour(juce::Colour::fromFloatRGBA(intensity, intensity, intensity, 1.0f));
+            minVal = std::min(minVal, matrix[i][j]);
+            maxVal = std::max(maxVal, matrix[i][j]);
+        }
+    }
+
+    // Create a high-contrast color gradient for better visibility.
+    juce::ColourGradient gradient;
+    gradient.addColour(0.0, juce::Colours::darkblue);
+    gradient.addColour(0.5, juce::Colours::grey);
+    gradient.addColour(1.0, juce::Colours::yellow);
+
+    for (int i = 0; i < numCells; ++i)
+    {
+        for (int j = 0; j < numCells; ++j)
+        {
+            float value = matrix[i][j];
+            // Normalize the value to the [0, 1] range based on the matrix's actual min and max.
+            double proportion = 0.0;
+            if (maxVal > minVal)
+            {
+                proportion = (value - minVal) / (maxVal - minVal);
+            }
+            g.setColour(gradient.getColourAtPosition(proportion));
             g.fillRect(i * cellWidth, j * cellHeight, cellWidth, cellHeight);
+        }
+    }
+
+    // Draw hover label
+    if (isMouseOver)
+    {
+        int xBeat = static_cast<int>(mousePosition.x / cellWidth);
+        int yBeat = static_cast<int>(mousePosition.y / cellHeight);
+
+        if (xBeat >= 0 && xBeat < numCells && yBeat >= 0 && yBeat < numCells)
+        {
+            juce::String labelText = "Beat X: " + juce::String(xBeat) + ", Beat Y: " + juce::String(yBeat);
+            
+            float textWidth = g.getCurrentFont().getStringWidth(labelText);
+
+            auto x = mousePosition.x + 12;
+            auto y = mousePosition.y;
+
+            if (x + textWidth > getWidth())
+                x = mousePosition.x - textWidth - 12;
+
+            g.setColour(juce::Colours::black.withAlpha(0.7f));
+            g.fillRoundedRectangle(x, y - 20, textWidth + 8, 18, 5.0f);
+
+            g.setColour(juce::Colours::white);
+            g.drawText(labelText, (int) x + 4, (int) y - 18, (int) textWidth, 14, juce::Justification::left, true);
         }
     }
 
@@ -68,6 +113,19 @@ void SimilarityMatrixComponent::paint(juce::Graphics& g)
         g.setColour(juce::Colours::red.withAlpha(0.7f));
         g.drawVerticalLine(juce::roundToInt(xPosition), 0.0f, (float)getHeight());
     }
+}
+
+void SimilarityMatrixComponent::mouseMove(const juce::MouseEvent& event)
+{
+    mousePosition = event.getPosition();
+    isMouseOver = true;
+    repaint();
+}
+
+void SimilarityMatrixComponent::mouseExit(const juce::MouseEvent& event)
+{
+    isMouseOver = false;
+    repaint();
 }
 
 void SimilarityMatrixComponent::updateMatrix(const std::vector<std::vector<float>>& newMatrix)

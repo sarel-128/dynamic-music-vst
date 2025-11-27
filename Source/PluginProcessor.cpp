@@ -13,28 +13,14 @@ juce::AudioProcessorValueTreeState::ParameterLayout DynamicMusicVstAudioProcesso
     
     layout.add(std::make_unique<juce::AudioParameterFloat>("beatTightness",
                                                           "Beat Tightness",
-                                                          0.0f,
                                                           1.0f,
-                                                          0.4f));
+                                                          200.0f,
+                                                          100.0f));
                                                           
-    layout.add(std::make_unique<juce::AudioParameterFloat>("tempoInertia",
-                                                          "Tempo Inertia",
-                                                          0.0f,
-                                                          1.0f,
-                                                          0.5f));
+    // layout.add(std::make_unique<juce::AudioParameterBool>("showSimilarityMatrix",
+    //                                                      "Show Similarity Matrix",
+    //                                                      true));
 
-    layout.add(std::make_unique<juce::AudioParameterFloat>("onsetFollowing",
-                                                          "Onset Following",
-                                                          0.0f,
-                                                          1.0f,
-                                                          1.0f));
-
-    layout.add(std::make_unique<juce::AudioParameterFloat>("activationThreshold",
-                                                          "Activation Threshold",
-                                                          0.0f,
-                                                          1.0f,
-                                                          0.1f));
-                                                          
     layout.add(std::make_unique<juce::AudioParameterFloat>("trimStart",
                                                           "Trim Start",
                                                           0.0f,
@@ -144,6 +130,10 @@ void DynamicMusicVstAudioProcessor::prepareToPlay (double sampleRate, int sample
     clickAngle = 0.0;
     clickAngleDelta = 2.0 * juce::MathConstants<double>::pi * clickFrequency / sampleRate;
     clickSamplesRemaining = 0;
+
+    // Use this method as the place to do any pre-playback
+    // initialisation that you need..
+    audioAnalyser.prepare(sampleRate, 2048); // Prepare the analyser with the correct sample rate and FFT size
 }
 
 void DynamicMusicVstAudioProcessor::loadAudioFile(const juce::File& file)
@@ -316,23 +306,22 @@ void DynamicMusicVstAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         DBG("2. Detect Onsets: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
 
         stepStartTime = juce::Time::getMillisecondCounterHiRes();
-        estimatedBPM = audioAnalyser.estimateTempo(onsetEnvelope, getSampleRate(), 512);
+        estimatedBPM = audioAnalyser.estimateTempo(onsetEnvelope, getSampleRate(), 256);
+        tempogram = audioAnalyser.getLastTempogram();
+        globalAcf = audioAnalyser.getLastGlobalAcf(); // Store aggregated profile for the UI
         DBG("3. Estimate Tempo: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
         
-        auto tightness = parameters.getRawParameterValue("beatTightness")->load();
-        auto inertia = parameters.getRawParameterValue("tempoInertia")->load();
-        auto onsetWeight = parameters.getRawParameterValue("onsetFollowing")->load();
-        auto activationThreshold = parameters.getRawParameterValue("activationThreshold")->load();
+        auto tightnessValue = parameters.getRawParameterValue("beatTightness")->load();
         
         // Beat timestamps are relative to the start of the analysisBuffer
         stepStartTime = juce::Time::getMillisecondCounterHiRes();
-        auto relativeBeatTimestamps = audioAnalyser.findBeats(onsetEnvelope, estimatedBPM, getSampleRate(), 512, tightness, inertia, onsetWeight, activationThreshold);
+        auto relativeBeatTimestamps = audioAnalyser.findBeats(onsetEnvelope, estimatedBPM, tightnessValue);
         DBG("4. Find Beats: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
         
         // --- Calculate MFCCs and Similarity Matrix ---
         if (!relativeBeatTimestamps.empty())
         {
-            const int hopSize = 512;
+            const int hopSize = 256;
             stepStartTime = juce::Time::getMillisecondCounterHiRes();
             auto allMfccs = audioAnalyser.calculateMFCCs(analysisBuffer, getSampleRate());
             DBG("5. Calculate MFCCs: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
@@ -344,6 +333,10 @@ void DynamicMusicVstAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
             stepStartTime = juce::Time::getMillisecondCounterHiRes();
             similarityMatrix = audioAnalyser.createSimilarityMatrix(concatenatedMfccs);
             DBG("7. Create Similarity Matrix: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
+        }
+        else
+        {
+            similarityMatrix.clear();
         }
 
         // Offset the relative beat timestamps to get the absolute timestamps for playback

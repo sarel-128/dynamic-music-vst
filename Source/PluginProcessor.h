@@ -66,7 +66,10 @@ public:
     std::atomic<AnalysisState> analysisState { AnalysisState::Ready };
     float estimatedBPM { 120.0f };
     std::vector<double> beatTimestamps;
+    std::vector<std::vector<float>> mfccs;
     std::vector<std::vector<float>> similarityMatrix;
+    std::vector<std::vector<float>> tempogram;
+    std::vector<float> globalAcf;
 
 private:
     // --- Metronome Click Synthesis ---
@@ -100,5 +103,6 @@ private:
     std::vector<AudioSegment> remixMap;
     int remixPlaybackPosition = 0;
 
+    //==============================================================================
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (DynamicMusicVstAudioProcessor)
 };

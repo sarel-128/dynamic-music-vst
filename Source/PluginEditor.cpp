@@ -4,13 +4,24 @@
 DynamicMusicVstAudioProcessorEditor::DynamicMusicVstAudioProcessorEditor (DynamicMusicVstAudioProcessor& p, juce::AudioProcessorValueTreeState& vts)
     : AudioProcessorEditor (&p), audioProcessor (p), valueTreeState(vts), waveformDisplay(p)
 {
-    setSize (500, 800);
+    setSize (900, 900);
 
     // Waveform Display
     addAndMakeVisible(waveformDisplay);
 
     // Similarity Matrix Display
-    addAndMakeVisible(similarityMatrixDisplay);
+    // addAndMakeVisible(similarityMatrixDisplay);
+
+    // Tempogram Display
+    addAndMakeVisible(tempogramDisplay);
+
+    // Show Similarity Matrix Toggle
+    // showSimilarityMatrixButton.setButtonText("Show Similarity Matrix");
+    // addAndMakeVisible(showSimilarityMatrixButton);
+    // showSimilarityMatrixAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(valueTreeState, "showSimilarityMatrix", showSimilarityMatrixButton);
+    // valueTreeState.addParameterListener("showSimilarityMatrix", this);
+    // Initial visibility for startup
+    // similarityMatrixDisplay.setVisible(valueTreeState.getRawParameterValue("showSimilarityMatrix")->load());
 
     // Target Duration Slider
     targetDurationAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(valueTreeState, "targetDuration", targetDurationSlider);
@@ -32,26 +43,6 @@ DynamicMusicVstAudioProcessorEditor::DynamicMusicVstAudioProcessorEditor (Dynami
     beatTightnessLabel.setText("Beat Tightness", juce::dontSendNotification);
     beatTightnessLabel.setJustificationType(juce::Justification::centredRight);
     addAndMakeVisible(beatTightnessLabel);
-
-    // Tempo Inertia Slider
-    tempoInertiaAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(valueTreeState, "tempoInertia", tempoInertiaSlider);
-    tempoInertiaSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-    tempoInertiaSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 90, 20);
-    tempoInertiaSlider.setPopupDisplayEnabled(true, false, this);
-    addAndMakeVisible(tempoInertiaSlider);
-    tempoInertiaLabel.setText("Tempo Inertia", juce::dontSendNotification);
-    tempoInertiaLabel.setJustificationType(juce::Justification::centredRight);
-    addAndMakeVisible(tempoInertiaLabel);
-
-    // Onset Following Slider
-    onsetFollowingAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(valueTreeState, "onsetFollowing", onsetFollowingSlider);
-    onsetFollowingSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-    onsetFollowingSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 90, 20);
-    onsetFollowingSlider.setPopupDisplayEnabled(true, false, this);
-    addAndMakeVisible(onsetFollowingSlider);
-    onsetFollowingLabel.setText("Onset Following", juce::dontSendNotification);
-    onsetFollowingLabel.setJustificationType(juce::Justification::centredRight);
-    addAndMakeVisible(onsetFollowingLabel);
 
     // Trim Sliders
     trimStartAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(valueTreeState, "trimStart", trimStartSlider);
@@ -103,15 +94,12 @@ DynamicMusicVstAudioProcessorEditor::DynamicMusicVstAudioProcessorEditor (Dynami
     tempoLabel.setJustificationType(juce::Justification::centred);
     addAndMakeVisible(tempoLabel);
 
-    // Beat Indicator
-    beatIndicator.setVisible(false);
-    addAndMakeVisible(beatIndicator);
-
     startTimerHz(60); // Poll 60 times per second for smoother animation
 }
 
 DynamicMusicVstAudioProcessorEditor::~DynamicMusicVstAudioProcessorEditor()
 {
+    // valueTreeState.removeParameterListener("showSimilarityMatrix", this);
     stopTimer();
 }
 
@@ -148,7 +136,8 @@ void DynamicMusicVstAudioProcessorEditor::timerCallback()
     waveformDisplay.repaint();
 
     auto playheadRatio = audioProcessor.getTotalLengthSecs() > 0 ? (float)audioProcessor.getCurrentPositionSecs() / (float)audioProcessor.getTotalLengthSecs() : 0.0f;
-    similarityMatrixDisplay.setPlayheadPosition(playheadRatio);
+    // similarityMatrixDisplay.setPlayheadPosition(playheadRatio);
+    tempogramDisplay.setPlayheadPosition(playheadRatio);
 
     if (audioProcessor.getTotalLengthSecs() > 0)
     {
@@ -160,34 +149,6 @@ void DynamicMusicVstAudioProcessorEditor::timerCallback()
     {
         trimStartSlider.setTextValueSuffix(" s");
         trimEndSlider.setTextValueSuffix(" s");
-    }
-
-    // Beat flickering logic - a more robust version
-    if (audioProcessor.isPlaying() && !audioProcessor.beatTimestamps.empty())
-    {
-        // Check if a beat has occurred since the last timer tick
-        double currentTime = audioProcessor.getCurrentPositionSecs();
-        double timeSinceLastTick = 1.0 / 60.0; // Corresponds to timer frequency (60Hz)
-        double previousTime = currentTime - timeSinceLastTick;
-
-        for(const auto& beatTime : audioProcessor.beatTimestamps)
-        {
-            if (beatTime > previousTime && beatTime <= currentTime)
-            {
-                lastBeatFlashTime = juce::Time::getMillisecondCounter();
-                break; // Only need to flash once per tick
-            }
-        }
-    }
-
-    const juce::uint32 flashDurationMs = 100;
-    if (juce::Time::getMillisecondCounter() - lastBeatFlashTime < flashDurationMs)
-    {
-        beatIndicator.setVisible(true);
-    }
-    else
-    {
-        beatIndicator.setVisible(false);
     }
 
     switch (audioProcessor.analysisState.load())
@@ -207,12 +168,20 @@ void DynamicMusicVstAudioProcessorEditor::timerCallback()
         case DynamicMusicVstAudioProcessor::AnalysisState::AnalysisComplete:
             statusLabel.setText("Analysis Complete!", juce::dontSendNotification);
             tempoLabel.setText("BPM: " + juce::String(audioProcessor.estimatedBPM, 1), juce::dontSendNotification);
-            analyzeButton.setEnabled(true);
-            similarityMatrixDisplay.updateBeatInfo(audioProcessor.beatTimestamps, audioProcessor.getTotalLengthSecs());
-            similarityMatrixDisplay.updateMatrix(audioProcessor.similarityMatrix);
+            // similarityMatrixDisplay.updateBeatInfo(audioProcessor.beatTimestamps, audioProcessor.getTotalLengthSecs());
+            // similarityMatrixDisplay.updateMatrix(audioProcessor.similarityMatrix);
+            tempogramDisplay.updateDisplayInfo(audioProcessor.tempogram, audioProcessor.globalAcf, audioProcessor.getSampleRate(), 256);
             audioProcessor.analysisState = DynamicMusicVstAudioProcessor::AnalysisState::Ready; // Reset state
             break;
     }
+}
+
+void DynamicMusicVstAudioProcessorEditor::parameterChanged(const juce::String &parameterID, float newValue)
+{
+    // if (parameterID == "showSimilarityMatrix")
+    // {
+    //     similarityMatrixDisplay.setVisible(newValue > 0.5f);
+    // }
 }
 
 void DynamicMusicVstAudioProcessorEditor::resized()
@@ -221,31 +190,39 @@ void DynamicMusicVstAudioProcessorEditor::resized()
     bounds.removeFromTop(25); // Make space for title
 
     auto usableBounds = bounds.reduced(10);
-    auto matrixWidth = usableBounds.getWidth();
 
-    juce::FlexBox mainFlexbox;
-    mainFlexbox.flexDirection = juce::FlexBox::Direction::column;
+    // --- Split main area into plots and controls ---
+    auto controlsWidth = 300;
+    auto plotsBounds = usableBounds.removeFromLeft(usableBounds.getWidth() - controlsWidth - 10);
+    auto controlsBounds = usableBounds.withLeft(plotsBounds.getRight() + 10);
 
-    // The similarity matrix display with a 1:1 aspect ratio
-    mainFlexbox.items.add(juce::FlexItem(similarityMatrixDisplay).withHeight(matrixWidth));
-    
-    // The waveform display below the matrix
-    mainFlexbox.items.add(juce::FlexItem(waveformDisplay).withHeight(80).withMargin(juce::FlexItem::Margin(5, 0, 0, 0)));
+    // --- Layout Plots Column ---
+    juce::FlexBox plotsBox;
+    plotsBox.flexDirection = juce::FlexBox::Direction::column;
+    // plotsBox.items.add(juce::FlexItem(similarityMatrixDisplay).withHeight(plotsBounds.getWidth()));
+    plotsBox.items.add(juce::FlexItem(tempogramDisplay).withHeight(120).withMargin(juce::FlexItem::Margin(5, 0, 0, 0)));
+    plotsBox.items.add(juce::FlexItem(waveformDisplay).withHeight(80).withMargin(juce::FlexItem::Margin(5, 0, 0, 0)));
+    plotsBox.performLayout(plotsBounds);
 
-    // --- Controls Row ---
-    juce::FlexBox controlsFlexbox;
-    controlsFlexbox.flexDirection = juce::FlexBox::Direction::row;
-    controlsFlexbox.justifyContent = juce::FlexBox::JustifyContent::spaceAround;
-    controlsFlexbox.alignItems = juce::FlexBox::AlignItems::center;
+    // --- Layout Controls Column ---
+    juce::FlexBox controlsBox;
+    controlsBox.flexDirection = juce::FlexBox::Direction::column;
 
-    controlsFlexbox.items.add(juce::FlexItem(openFileButton).withWidth(120).withHeight(30));
-    controlsFlexbox.items.add(juce::FlexItem(playButton).withWidth(60).withHeight(30));
-    controlsFlexbox.items.add(juce::FlexItem(stopButton).withWidth(60).withHeight(30));
-    controlsFlexbox.items.add(juce::FlexItem(analyzeButton).withWidth(80).withHeight(30));
+    // Buttons
+    juce::FlexBox buttonBox;
+    buttonBox.flexDirection = juce::FlexBox::Direction::row;
+    buttonBox.justifyContent = juce::FlexBox::JustifyContent::spaceAround;
+    buttonBox.alignItems = juce::FlexBox::AlignItems::center;
+    buttonBox.items.add(juce::FlexItem(openFileButton).withFlex(6.0f).withHeight(30));
+    buttonBox.items.add(juce::FlexItem(playButton).withFlex(3.0f).withHeight(30));
+    buttonBox.items.add(juce::FlexItem(stopButton).withFlex(3.0f).withHeight(30));
+    buttonBox.items.add(juce::FlexItem(analyzeButton).withFlex(4.0f).withHeight(30));
+    controlsBox.items.add(juce::FlexItem(buttonBox).withHeight(50));
 
-    mainFlexbox.items.add(juce::FlexItem(controlsFlexbox).withFlex(1.0f));
-    
-    // --- Sliders Area ---
+    // Toggle
+    // controlsBox.items.add(juce::FlexItem(showSimilarityMatrixButton).withHeight(30).withMargin(juce::FlexItem::Margin(10, 0, 10, 0)));
+
+    // Sliders
     auto createSliderRow = [](juce::Label& label, juce::Slider& slider)
     {
         juce::FlexBox box;
@@ -254,32 +231,22 @@ void DynamicMusicVstAudioProcessorEditor::resized()
         box.items.add(juce::FlexItem(slider).withFlex(2.0f));
         return box;
     };
-    
     juce::FlexBox durationRow = createSliderRow(targetDurationLabel, targetDurationSlider);
     juce::FlexBox tightnessRow = createSliderRow(beatTightnessLabel, beatTightnessSlider);
-    juce::FlexBox inertiaRow = createSliderRow(tempoInertiaLabel, tempoInertiaSlider);
-    juce::FlexBox onsetRow = createSliderRow(onsetFollowingLabel, onsetFollowingSlider);
     juce::FlexBox trimStartRow = createSliderRow(trimStartLabel, trimStartSlider);
     juce::FlexBox trimEndRow = createSliderRow(trimEndLabel, trimEndSlider);
+    controlsBox.items.add(juce::FlexItem(durationRow).withFlex(1.0f));
+    controlsBox.items.add(juce::FlexItem(tightnessRow).withFlex(1.0f));
+    controlsBox.items.add(juce::FlexItem(trimStartRow).withFlex(1.0f));
+    controlsBox.items.add(juce::FlexItem(trimEndRow).withFlex(1.0f));
 
-    mainFlexbox.items.add(juce::FlexItem(durationRow).withFlex(1.0f));
-    mainFlexbox.items.add(juce::FlexItem(tightnessRow).withFlex(1.0f));
-    mainFlexbox.items.add(juce::FlexItem(inertiaRow).withFlex(1.0f));
-    mainFlexbox.items.add(juce::FlexItem(onsetRow).withFlex(1.0f));
-    mainFlexbox.items.add(juce::FlexItem(trimStartRow).withFlex(1.0f));
-    mainFlexbox.items.add(juce::FlexItem(trimEndRow).withFlex(1.0f));
-
-    // --- Status Area ---
+    // Status
     juce::FlexBox statusBox;
     statusBox.flexDirection = juce::FlexBox::Direction::row;
     statusBox.justifyContent = juce::FlexBox::JustifyContent::spaceAround;
     statusBox.items.add(juce::FlexItem(statusLabel).withFlex(1.0f));
     statusBox.items.add(juce::FlexItem(tempoLabel).withFlex(1.0f));
-    
-    mainFlexbox.items.add(juce::FlexItem(statusBox).withFlex(0.5f));
-    
-    mainFlexbox.performLayout(usableBounds);
+    controlsBox.items.add(juce::FlexItem(statusBox).withFlex(0.5f));
 
-    // Position beat indicator in the top right
-    beatIndicator.setBounds(bounds.getRight() - 30, bounds.getY() + 10, 20, 20);
+    controlsBox.performLayout(controlsBounds);
 }
