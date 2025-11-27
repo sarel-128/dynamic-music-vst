@@ -68,33 +68,90 @@ public:
     {
         g.fillAll(juce::Colours::black);
 
-        if (tempogramImage.isNull())
+        if (tempogram.empty() || tempogram[0].empty())
         {
             g.setColour(juce::Colours::white);
             g.drawText("No data", getLocalBounds(), juce::Justification::centred, false);
             return;
         }
-        
-        // --- Draw the cached tempogram image ---
-        g.drawImage(tempogramImage, getLocalBounds().toFloat());
 
-        // --- Y-axis info needed for overlays ---
-        const int minBPM = 16;
-        const int maxBPM = 300;
+        int numFrames = tempogram.size();
+        int numLagsTotal = tempogram[0].size();
+        
+        // --- Y-axis cropping to 55-200 BPM range ---
+        const int minBPM = 55;
+        const int maxBPM = 200;
         int minLag = static_cast<int>(60.0 * sampleRate / (hopLength * maxBPM));
         int maxLag = static_cast<int>(60.0 * sampleRate / (hopLength * minBPM));
         minLag = juce::jmax(0, minLag);
-        if (tempogram.size() > 0)
+        maxLag = juce::jmin(numLagsTotal - 1, maxLag);
+
+        if (minLag >= maxLag)
         {
-            maxLag = juce::jmin((int)tempogram.size() - 1, maxLag);
-        } else {
-            maxLag = minLag;
+            g.setColour(juce::Colours::white);
+            g.drawText("Tempo range not available", getLocalBounds(), juce::Justification::centred, false);
+            return;
         }
-        
-        if (minLag >= maxLag) return; // Nothing to draw for overlays
-        
+
         int numLagsToDisplay = maxLag - minLag + 1;
+        
+        int numFramesToDraw = (numFrames + resolution - 1) / resolution;
+        float cellWidth = (float)getWidth() / numFramesToDraw;
         float cellHeight = (float)getHeight() / numLagsToDisplay;
+
+        // --- Normalize the tempogram based on the visible range for full contrast ---
+        float minVal = std::numeric_limits<float>::max();
+        float maxVal = std::numeric_limits<float>::min();
+        for (int i=0; i < numFrames; ++i)
+        {
+            for (int j=minLag; j <= maxLag; ++j)
+            {
+                minVal = std::min(minVal, tempogram[i][j]);
+                maxVal = std::max(maxVal, tempogram[i][j]);
+            }
+        }
+
+        // Create a viridis-like color gradient
+        juce::ColourGradient gradient;
+        gradient.addColour(0.0, juce::Colour::fromString("0xff440154")); // Dark Purple
+        gradient.addColour(0.25, juce::Colour::fromString("0xff3b528b"));// Blue
+        gradient.addColour(0.5, juce::Colour::fromString("0xff21918c")); // Green
+        gradient.addColour(0.75, juce::Colour::fromString("0xff5ec962"));// Light Green
+        gradient.addColour(1.0, juce::Colour::fromString("0xfffde725")); // Yellow
+
+        for (int i = 0; i < numFramesToDraw; ++i)
+        {
+            for (int j = minLag; j <= maxLag; ++j)
+            {
+                float avgValue = 0.0f;
+                int count = 0;
+                for (int k = 0; k < resolution; ++k)
+                {
+                    int frameIndex = i * resolution + k;
+                    if (frameIndex < numFrames)
+                    {
+                        avgValue += tempogram[frameIndex][j];
+                        count++;
+                    }
+                }
+
+                if (count > 0)
+                {
+                    avgValue /= count;
+                }
+                
+                double proportion = 0.0;
+                if (maxVal > minVal)
+                {
+                    proportion = (avgValue - minVal) / (maxVal - minVal);
+                }
+                g.setColour(gradient.getColourAtPosition(proportion));
+                
+                // Map lag 'j' to the display rect
+                int displayRow = j - minLag;
+                g.fillRect((float)i * cellWidth, (float)(numLagsToDisplay - 1 - displayRow) * cellHeight, cellWidth, cellHeight);
+            }
+        }
 
         // --- Overlay the aggregated tempo profile ---
         if (!aggregatedProfile.empty())
@@ -143,9 +200,9 @@ public:
         if (isMouseOver)
         {
             // Calculate Time (X-axis)
-            int numFrames = tempogram.empty() ? 0 : tempogram[0].size();
-            float frameIndex = (float)mousePosition.x / getWidth() * numFrames;
-            float timeInSeconds = frameIndex * hopLength / sampleRate;
+            float timeRatio = mousePosition.x / (float)getWidth();
+            float totalTime = (float)numFrames * hopLength / sampleRate;
+            float timeInSeconds = timeRatio * totalTime;
 
             // Calculate BPM (Y-axis)
             float yProportion = 1.0f - ((float)mousePosition.y / getHeight());
@@ -162,9 +219,7 @@ public:
             {
                 juce::String labelText = "Time: " + juce::String(timeInSeconds, 2) + "s, BPM: " + juce::String(bpm, 1);
                 
-                juce::GlyphArrangement glyphs;
-                glyphs.addJustifiedText(g.getCurrentFont(), labelText, 0, 0, getWidth(), 1.0f);
-                float textWidth = glyphs.getBoundingBox(0, glyphs.getNumGlyphs(), true).getWidth();
+                float textWidth = g.getCurrentFont().getStringWidth(labelText);
                 
                 auto x = mousePosition.x + 12;
                 auto y = mousePosition.y;
@@ -187,7 +242,6 @@ public:
         aggregatedProfile = newAggregatedProfile;
         sampleRate = sr;
         hopLength = hl;
-        renderTempogramImage();
         repaint();
     }
 
@@ -211,78 +265,12 @@ public:
     }
 
 private:
-    void renderTempogramImage()
-    {
-        if (tempogram.empty() || tempogram[0].empty())
-        {
-            tempogramImage = juce::Image(); // Clear image
-            return;
-        }
-        
-        // Define a fixed resolution for the image to improve performance
-        const int imageWidth = 512;
-        const int imageHeight = 256;
-        tempogramImage = juce::Image(juce::Image::RGB, imageWidth, imageHeight, true);
-        juce::Graphics g(tempogramImage);
-        
-        int numFrames = tempogram[0].size();
-        int numLagsTotal = tempogram.size();
-        
-        const int minBPM = 16;
-        const int maxBPM = 300;
-        int minLag = static_cast<int>(60.0 * sampleRate / (hopLength * maxBPM));
-        int maxLag = static_cast<int>(60.0 * sampleRate / (hopLength * minBPM));
-        minLag = juce::jmax(0, minLag);
-        maxLag = juce::jmin(numLagsTotal - 1, maxLag);
-
-        if (minLag >= maxLag) return;
-
-        int numLagsToDisplay = maxLag - minLag + 1;
-        float cellWidth = (float)imageWidth / numFrames;
-        float cellHeight = (float)imageHeight / numLagsToDisplay;
-
-        float minVal = std::numeric_limits<float>::max();
-        float maxVal = std::numeric_limits<float>::min();
-        for (int i=0; i < numFrames; ++i)
-        {
-            for (int j=minLag; j <= maxLag; ++j)
-            {
-                minVal = std::min(minVal, tempogram[j][i]);
-                maxVal = std::max(maxVal, tempogram[j][i]);
-            }
-        }
-
-        juce::ColourGradient gradient;
-        gradient.addColour(0.0, juce::Colour::fromString("0xff440154"));
-        gradient.addColour(0.25, juce::Colour::fromString("0xff3b528b"));
-        gradient.addColour(0.5, juce::Colour::fromString("0xff21918c"));
-        gradient.addColour(0.75, juce::Colour::fromString("0xff5ec962"));
-        gradient.addColour(1.0, juce::Colour::fromString("0xfffde725"));
-
-        for (int i = 0; i < numFrames; ++i)
-        {
-            for (int j = minLag; j <= maxLag; ++j)
-            {
-                float value = tempogram[j][i];
-                double proportion = 0.0;
-                if (maxVal > minVal)
-                {
-                    proportion = (value - minVal) / (maxVal - minVal);
-                }
-                g.setColour(gradient.getColourAtPosition(proportion));
-                
-                int displayRow = j - minLag;
-                g.fillRect((float)i * cellWidth, (float)(numLagsToDisplay - 1 - displayRow) * cellHeight, cellWidth, cellHeight);
-            }
-        }
-    }
-
     std::vector<std::vector<float>> tempogram;
     std::vector<float> aggregatedProfile;
-    juce::Image tempogramImage;
     float playheadPosition = 0.0f;
     double sampleRate = 44100.0;
     int hopLength = 512;
+    int resolution = 256;
     juce::Point<int> mousePosition;
     bool isMouseOver = false;
 };
@@ -309,7 +297,7 @@ private:
     juce::AudioProcessorValueTreeState& valueTreeState;
     
     WaveformDisplay waveformDisplay;
-    // SimilarityMatrixComponent similarityMatrixDisplay;
+    SimilarityMatrixComponent similarityMatrixDisplay;
     TempogramDisplayComponent tempogramDisplay;
     juce::Slider targetDurationSlider;
     juce::Slider beatTightnessSlider;
@@ -325,13 +313,13 @@ private:
     juce::Label beatTightnessLabel;
     juce::Label trimStartLabel;
     juce::Label trimEndLabel;
-    // juce::ToggleButton showSimilarityMatrixButton;
+    juce::ToggleButton showSimilarityMatrixButton;
 
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> targetDurationAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> beatTightnessAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> trimStartAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> trimEndAttachment;
-    // std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> showSimilarityMatrixAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> showSimilarityMatrixAttachment;
     std::unique_ptr<juce::FileChooser> fileChooser;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (DynamicMusicVstAudioProcessorEditor)

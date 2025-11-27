@@ -17,9 +17,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout DynamicMusicVstAudioProcesso
                                                           200.0f,
                                                           100.0f));
                                                           
-    // layout.add(std::make_unique<juce::AudioParameterBool>("showSimilarityMatrix",
-    //                                                      "Show Similarity Matrix",
-    //                                                      true));
+    layout.add(std::make_unique<juce::AudioParameterBool>("showSimilarityMatrix",
+                                                         "Show Similarity Matrix",
+                                                         true));
 
     layout.add(std::make_unique<juce::AudioParameterFloat>("trimStart",
                                                           "Trim Start",
@@ -130,10 +130,6 @@ void DynamicMusicVstAudioProcessor::prepareToPlay (double sampleRate, int sample
     clickAngle = 0.0;
     clickAngleDelta = 2.0 * juce::MathConstants<double>::pi * clickFrequency / sampleRate;
     clickSamplesRemaining = 0;
-
-    // Use this method as the place to do any pre-playback
-    // initialisation that you need..
-    audioAnalyser.prepare(sampleRate, 2048); // Prepare the analyser with the correct sample rate and FFT size
 }
 
 void DynamicMusicVstAudioProcessor::loadAudioFile(const juce::File& file)
@@ -315,7 +311,7 @@ void DynamicMusicVstAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         
         // Beat timestamps are relative to the start of the analysisBuffer
         stepStartTime = juce::Time::getMillisecondCounterHiRes();
-        auto relativeBeatTimestamps = audioAnalyser.findBeats(onsetEnvelope, estimatedBPM, tightnessValue);
+        auto relativeBeatTimestamps = audioAnalyser.findBeats(onsetEnvelope, estimatedBPM, getSampleRate(), 256, tightnessValue);
         DBG("4. Find Beats: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
         
         // --- Calculate MFCCs and Similarity Matrix ---

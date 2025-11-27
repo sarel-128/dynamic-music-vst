@@ -10,18 +10,18 @@ DynamicMusicVstAudioProcessorEditor::DynamicMusicVstAudioProcessorEditor (Dynami
     addAndMakeVisible(waveformDisplay);
 
     // Similarity Matrix Display
-    // addAndMakeVisible(similarityMatrixDisplay);
+    addAndMakeVisible(similarityMatrixDisplay);
 
     // Tempogram Display
     addAndMakeVisible(tempogramDisplay);
 
     // Show Similarity Matrix Toggle
-    // showSimilarityMatrixButton.setButtonText("Show Similarity Matrix");
-    // addAndMakeVisible(showSimilarityMatrixButton);
-    // showSimilarityMatrixAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(valueTreeState, "showSimilarityMatrix", showSimilarityMatrixButton);
-    // valueTreeState.addParameterListener("showSimilarityMatrix", this);
+    showSimilarityMatrixButton.setButtonText("Show Similarity Matrix");
+    addAndMakeVisible(showSimilarityMatrixButton);
+    showSimilarityMatrixAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(valueTreeState, "showSimilarityMatrix", showSimilarityMatrixButton);
+    valueTreeState.addParameterListener("showSimilarityMatrix", this);
     // Initial visibility for startup
-    // similarityMatrixDisplay.setVisible(valueTreeState.getRawParameterValue("showSimilarityMatrix")->load());
+    similarityMatrixDisplay.setVisible(valueTreeState.getRawParameterValue("showSimilarityMatrix")->load());
 
     // Target Duration Slider
     targetDurationAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(valueTreeState, "targetDuration", targetDurationSlider);
@@ -99,7 +99,7 @@ DynamicMusicVstAudioProcessorEditor::DynamicMusicVstAudioProcessorEditor (Dynami
 
 DynamicMusicVstAudioProcessorEditor::~DynamicMusicVstAudioProcessorEditor()
 {
-    // valueTreeState.removeParameterListener("showSimilarityMatrix", this);
+    valueTreeState.removeParameterListener("showSimilarityMatrix", this);
     stopTimer();
 }
 
@@ -136,7 +136,7 @@ void DynamicMusicVstAudioProcessorEditor::timerCallback()
     waveformDisplay.repaint();
 
     auto playheadRatio = audioProcessor.getTotalLengthSecs() > 0 ? (float)audioProcessor.getCurrentPositionSecs() / (float)audioProcessor.getTotalLengthSecs() : 0.0f;
-    // similarityMatrixDisplay.setPlayheadPosition(playheadRatio);
+    similarityMatrixDisplay.setPlayheadPosition(playheadRatio);
     tempogramDisplay.setPlayheadPosition(playheadRatio);
 
     if (audioProcessor.getTotalLengthSecs() > 0)
@@ -168,8 +168,8 @@ void DynamicMusicVstAudioProcessorEditor::timerCallback()
         case DynamicMusicVstAudioProcessor::AnalysisState::AnalysisComplete:
             statusLabel.setText("Analysis Complete!", juce::dontSendNotification);
             tempoLabel.setText("BPM: " + juce::String(audioProcessor.estimatedBPM, 1), juce::dontSendNotification);
-            // similarityMatrixDisplay.updateBeatInfo(audioProcessor.beatTimestamps, audioProcessor.getTotalLengthSecs());
-            // similarityMatrixDisplay.updateMatrix(audioProcessor.similarityMatrix);
+            similarityMatrixDisplay.updateBeatInfo(audioProcessor.beatTimestamps, audioProcessor.getTotalLengthSecs());
+            similarityMatrixDisplay.updateMatrix(audioProcessor.similarityMatrix);
             tempogramDisplay.updateDisplayInfo(audioProcessor.tempogram, audioProcessor.globalAcf, audioProcessor.getSampleRate(), 256);
             audioProcessor.analysisState = DynamicMusicVstAudioProcessor::AnalysisState::Ready; // Reset state
             break;
@@ -178,10 +178,10 @@ void DynamicMusicVstAudioProcessorEditor::timerCallback()
 
 void DynamicMusicVstAudioProcessorEditor::parameterChanged(const juce::String &parameterID, float newValue)
 {
-    // if (parameterID == "showSimilarityMatrix")
-    // {
-    //     similarityMatrixDisplay.setVisible(newValue > 0.5f);
-    // }
+    if (parameterID == "showSimilarityMatrix")
+    {
+        similarityMatrixDisplay.setVisible(newValue > 0.5f);
+    }
 }
 
 void DynamicMusicVstAudioProcessorEditor::resized()
@@ -199,7 +199,7 @@ void DynamicMusicVstAudioProcessorEditor::resized()
     // --- Layout Plots Column ---
     juce::FlexBox plotsBox;
     plotsBox.flexDirection = juce::FlexBox::Direction::column;
-    // plotsBox.items.add(juce::FlexItem(similarityMatrixDisplay).withHeight(plotsBounds.getWidth()));
+    plotsBox.items.add(juce::FlexItem(similarityMatrixDisplay).withHeight(plotsBounds.getWidth()));
     plotsBox.items.add(juce::FlexItem(tempogramDisplay).withHeight(120).withMargin(juce::FlexItem::Margin(5, 0, 0, 0)));
     plotsBox.items.add(juce::FlexItem(waveformDisplay).withHeight(80).withMargin(juce::FlexItem::Margin(5, 0, 0, 0)));
     plotsBox.performLayout(plotsBounds);
@@ -220,7 +220,7 @@ void DynamicMusicVstAudioProcessorEditor::resized()
     controlsBox.items.add(juce::FlexItem(buttonBox).withHeight(50));
 
     // Toggle
-    // controlsBox.items.add(juce::FlexItem(showSimilarityMatrixButton).withHeight(30).withMargin(juce::FlexItem::Margin(10, 0, 10, 0)));
+    controlsBox.items.add(juce::FlexItem(showSimilarityMatrixButton).withHeight(30).withMargin(juce::FlexItem::Margin(10, 0, 10, 0)));
 
     // Sliders
     auto createSliderRow = [](juce::Label& label, juce::Slider& slider)

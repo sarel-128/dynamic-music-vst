@@ -6,18 +6,9 @@
 
 AudioAnalysis::AudioAnalysis()
 {
-    // Constructor is now empty. Filterbank is created in the new prepare() method
-    // to ensure the correct sample rate is used.
-}
-
-void AudioAnalysis::prepare(double sampleRate, int fftSize)
-{
-    this->sampleRate = sampleRate;
-    this->fftSize = fftSize;
-    this->hopSize = fftSize / 4; // Common setting for good time/freq resolution
-
-    // Pre-calculate the filterbank with parameters matching Librosa's defaults for onset detection.
-    createMelFilterbank(128, this->fftSize, this->sampleRate);
+    // Pre-calculate the filterbank for a standard FFT size and sample rate.
+    // A more advanced implementation might recreate this if the sample rate changes.
+    createMelFilterbank(40, 1024, 44100.0);
 }
 
 double AudioAnalysis::hzToMel(double hz)
@@ -83,388 +74,185 @@ void AudioAnalysis::createMelFilterbank(int numBands, int fftSize, double sample
 
 std::vector<float> AudioAnalysis::getOnsetStrengthEnvelope(const juce::AudioBuffer<float>& buffer)
 {
-    // These are now class members, initialized in prepare()
-    // const int fftSize = 2048;
-    // const int hopSize = 512;
-    
-    // --- Librosa Alignment: Centered frames ---
-    // Create a padded version of the buffer to emulate center=true in librosa's STFT
-    int padding = fftSize / 2;
-    // The padded buffer is zero-initialized by its constructor.
-    juce::AudioBuffer<float> paddedBuffer(buffer.getNumChannels(), buffer.getNumSamples() + 2 * padding);
-    for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
-    {
-        // Just copy the original data into the center of the zero-padded buffer.
-        // This is a safe way to implement centered framing.
-        paddedBuffer.copyFrom(ch, padding, buffer, ch, 0, buffer.getNumSamples());
-    }
-    
-    auto* audioData = paddedBuffer.getReadPointer(0); // Analyze mono
-    int numSamples = paddedBuffer.getNumSamples();
-
-    // --- First Pass: Calculate all Mel Power Spectrograms and find global max ---
-    std::vector<std::vector<float>> allMelSpectrums;
-    float globalMax = 0.0f;
-    
+    const int fftSize = 1024;
+    const int hopSize = 256;
     juce::dsp::FFT fft(log2(fftSize));
+    auto* audioData = buffer.getReadPointer(0); // Analyze mono
+    int numSamples = buffer.getNumSamples();
+    std::vector<float> onsetEnvelope;
+
+    // Pre-allocate buffers outside the loop for performance
     std::vector<float> window(fftSize);
+    std::vector<float> windowedData(fftSize);
+    std::vector<float> fftBuffer(fftSize * 2, 0.0f);
+    std::vector<float> currentMelSpectrum(melFilterbank.size(), 0.0f);
+    std::vector<float> lastMelSpectrum(melFilterbank.size(), 0.0f);
+
     for(int j=0; j<fftSize; ++j) {
-        window[j] = 0.5f - 0.5f * std::cos(2.0f * M_PI * j / (fftSize - 1));
+        window[j] = 0.5f - 0.5f * cos(2.0f * M_PI * j / (fftSize - 1));
     }
 
-    for (int i = 0; i + fftSize <= numSamples; i += hopSize)
+    for (int i = 0; i + fftSize < numSamples; i += hopSize)
     {
-        std::vector<float> windowedData(fftSize);
         for(int j=0; j<fftSize; ++j) {
             windowedData[j] = audioData[i+j] * window[j];
         }
 
-        std::vector<float> fftBuffer(fftSize * 2, 0.0f);
+        std::fill(fftBuffer.begin(), fftBuffer.end(), 0.0f);
         std::copy(windowedData.begin(), windowedData.end(), fftBuffer.begin());
-        fft.performFrequencyOnlyForwardTransform(fftBuffer.data());
 
-        std::vector<float> melPower(melFilterbank.size(), 0.0f);
+        fft.performFrequencyOnlyForwardTransform(fftBuffer.data());
+        
+        // Apply the Mel filterbank to the FFT output (sparse multiplication)
+        std::fill(currentMelSpectrum.begin(), currentMelSpectrum.end(), 0.0f);
         for (size_t band = 0; band < melFilterbank.size(); ++band)
         {
             for (const auto& binWeightPair : melFilterbank[band])
             {
-                melPower[band] += fftBuffer[binWeightPair.first];
-            }
-            melPower[band] = melPower[band] * melPower[band]; // Convert to power
-            globalMax = std::max(globalMax, melPower[band]);
-        }
-        allMelSpectrums.push_back(melPower);
-    }
-    
-    // --- Second Pass: Convert to dB relative to global max ---
-    std::vector<std::vector<float>> S_log_power;
-    float amin = 1e-10f; // Floor for log calculation, similar to librosa
-
-    for(const auto& melPowerFrame : allMelSpectrums)
-    {
-        std::vector<float> currentMelSpectrum(melFilterbank.size());
-        for(size_t band = 0; band < melPowerFrame.size(); ++band)
-        {
-            float power = melPowerFrame[band];
-            if (power < amin) power = amin;
-            // Librosa's power_to_db: 10.0 * log10(S / ref) with ref=globalMax
-            currentMelSpectrum[band] = 10.0f * std::log10(power / globalMax);
-        }
-        S_log_power.push_back(currentMelSpectrum);
-    }
-    
-    // --- Third Pass: Calculate onset strength envelope from S_log_power (a la onset_strength_multi) ---
-    const int lag = 1;
-    const int max_size = 1; // librosa default
-    const int num_frames = S_log_power.size();
-    const int num_bands = num_frames > 0 ? S_log_power[0].size() : 0;
-
-    // 1. Create the reference spectrogram
-    auto& ref_log_power = S_log_power; // By default, ref is S (max_size=1)
-    std::vector<std::vector<float>> S_filtered;
-    if (max_size > 1)
-    {
-        S_filtered.resize(num_frames, std::vector<float>(num_bands));
-        for (int t = 0; t < num_frames; ++t) {
-            for (int b = 0; b < num_bands; ++b) {
-                float max_val = -std::numeric_limits<float>::infinity();
-                int start = std::max(0, b - max_size / 2);
-                int end = std::min(num_bands, b + max_size / 2 + 1);
-                for (int k = start; k < end; ++k) {
-                    max_val = std::max(max_val, S_log_power[t][k]);
-                }
-                S_filtered[t][b] = max_val;
+                currentMelSpectrum[band] += fftBuffer[binWeightPair.first] * binWeightPair.second;
             }
         }
-        ref_log_power = S_filtered;
-    }
 
-    // 2. Compute raw spectral flux
-    std::vector<float> raw_flux;
-    raw_flux.reserve(num_frames);
-    for (size_t t = lag; t < num_frames; ++t)
-    {
-        float sumOfDifferences = 0.0f;
-        int countOfPositiveDifferences = 0;
-        for (size_t band = 0; band < num_bands; ++band) {
-            float spectralDifference = S_log_power[t][band] - ref_log_power[t - lag][band];
+        // // --- Logarithmic Compression of the Mel Spectrum ---
+        // // This reduces the dynamic range, making onsets in quiet sections
+        // // more comparable to onsets in loud sections.
+        // for(auto& val : currentMelSpectrum) {
+        //     val = std::log1p(val * 100.0f); // Scale factor can be tuned
+        // }
+
+        // Calculate spectral flux on the Mel spectrum
+        float flux = 0.0f;
+        for (size_t band = 0; band < melFilterbank.size(); ++band) {
+            float spectralDifference = currentMelSpectrum[band] - lastMelSpectrum[band];
             if (spectralDifference > 0)
             {
-                sumOfDifferences += spectralDifference;
-                countOfPositiveDifferences++;
+                // Weight the flux by the Mel band index. This emphasizes changes
+                // in higher frequencies, which often correspond to sharper transients,
+                // providing a clearer rhythmic pulse.
+                float weight = static_cast<float>(band + 1);
+                flux += spectralDifference * weight;
             }
         }
         
-        float flux = 0.0f;
-        if (countOfPositiveDifferences > 0)
-        {
-            flux = sumOfDifferences / countOfPositiveDifferences;
-        }
-        raw_flux.push_back(flux);
-    }
-
-    // 3. Compensate for lag and centering, then pad and trim
-    int pad_width = lag;
-    pad_width += fftSize / (2 * hopSize); // center=true compensation
-
-    std::vector<float> onsetEnvelope(num_frames, 0.0f);
-    int start_frame = pad_width;
-    int end_frame = std::min((int)onsetEnvelope.size(), start_frame + (int)raw_flux.size());
-
-    for(int i = start_frame; i < end_frame; ++i)
-    {
-        onsetEnvelope[i] = raw_flux[i - start_frame];
+        onsetEnvelope.push_back(flux);
+        lastMelSpectrum = currentMelSpectrum;
     }
 
     return onsetEnvelope;
 }
 
-std::vector<int> AudioAnalysis::onsetBacktrack(const std::vector<int>& events, const std::vector<float>& energy)
-{
-    // Find points where energy is non-increasing then increasing
-    std::vector<int> minima;
-    for (size_t i = 1; i < energy.size() - 1; ++i)
-    {
-        if (energy[i] <= energy[i - 1] && energy[i] < energy[i + 1])
-        {
-            minima.push_back(i);
-        }
-    }
-
-    if (minima.empty())
-    {
-        return events; // No minima found, return original events
-    }
-    
-    std::vector<int> backtrackedEvents;
-    backtrackedEvents.reserve(events.size());
-
-    for (int eventFrame : events)
-    {
-        // Find the closest minimum *before* the event
-        auto it = std::lower_bound(minima.begin(), minima.end(), eventFrame);
-        if (it != minima.begin())
-        {
-            --it; // Move to the last element that is not greater than eventFrame
-            backtrackedEvents.push_back(*it);
-        }
-        else
-        {
-            // No preceding minimum found, use the first minimum as a fallback
-            // or you could decide to keep the original event frame.
-            // Librosa's `match_events` would effectively do this.
-            backtrackedEvents.push_back(minima[0]);
-        }
-    }
-    
-    return backtrackedEvents;
-}
-
-
 std::vector<int> AudioAnalysis::detectOnsets(const std::vector<float>& onsetEnvelope)
 {
-    if (onsetEnvelope.empty())
+    std::vector<int> onsets;
+    const int hopSize = 256; // Must match the hop size from getOnsetStrengthEnvelope
+    const int windowSize = 10; // Frames for moving average
+    const float constant = 0.03; // Constant to add to threshold
+
+    if (onsetEnvelope.size() < windowSize)
     {
-        return {};
+        return onsets;
     }
 
-    // --- 1. Normalize onset envelope to [0, 1] ---
-    std::vector<float> normalizedEnvelope = onsetEnvelope;
-    float minVal = std::numeric_limits<float>::max();
-    float maxVal = std::numeric_limits<float>::lowest();
-    for (float val : normalizedEnvelope)
+    // A more robust peak picking using a moving average threshold
+    for (size_t i = windowSize; i < onsetEnvelope.size() - windowSize; ++i)
     {
-        if (val < minVal) minVal = val;
-        if (val > maxVal) maxVal = val;
-    }
-
-    float range = maxVal - minVal;
-    if (range > 1e-8) // Avoid division by zero if envelope is flat
-    {
-        for (auto& val : normalizedEnvelope)
+        // Calculate local average (threshold)
+        float sum = 0.0f;
+        for(int j = -windowSize; j <= windowSize; ++j)
         {
-            val = (val - minVal) / range;
+            sum += onsetEnvelope[i + j];
         }
-    }
+        float threshold = sum / (2 * windowSize + 1) + constant;
 
-    // --- 2. Set up parameters, mirroring librosa's defaults ---
-    const float pre_max_s = 0.03f;
-    const float post_max_s = 0.0f;
-    const float pre_avg_s = 0.10f;
-    const float post_avg_s = 0.10f;
-    const float wait_s = 0.03f;
-    const float delta = 0.07f;
-
-    int pre_max = static_cast<int>(std::round(pre_max_s * sampleRate / hopSize));
-    int post_max = static_cast<int>(std::round(post_max_s * sampleRate / hopSize)) + 1;
-    int pre_avg = static_cast<int>(std::round(pre_avg_s * sampleRate / hopSize));
-    int post_avg = static_cast<int>(std::round(post_avg_s * sampleRate / hopSize)) + 1;
-    int wait = static_cast<int>(std::round(wait_s * sampleRate / hopSize));
-
-    // --- 3. Peak picking ---
-    std::vector<int> peaks;
-    const int num_frames = normalizedEnvelope.size();
-    
-    for (int i = 0; i < num_frames; ++i)
-    {
-        // a. Check for local maximum
-        float current_val = normalizedEnvelope[i];
-        bool is_max = true;
-        int max_start = std::max(0, i - pre_max);
-        int max_end = std::min(num_frames, i + post_max);
-        for (int j = max_start; j < max_end; ++j)
+        // Check for peak
+        if (onsetEnvelope[i] > onsetEnvelope[i - 1] && onsetEnvelope[i] > onsetEnvelope[i + 1] && onsetEnvelope[i] > threshold)
         {
-            if (normalizedEnvelope[j] > current_val)
-            {
-                is_max = false;
-                break;
-            }
-        }
-        
-        if (!is_max)
-        {
-            continue;
-        }
-
-        // b. Check against local average
-        float avg = 0.0f;
-        int avg_start = std::max(0, i - pre_avg);
-        int avg_end = std::min(num_frames, i + post_avg);
-        for (int j = avg_start; j < avg_end; ++j)
-        {
-            avg += normalizedEnvelope[j];
-        }
-        avg /= (avg_end - avg_start);
-
-        if (current_val >= avg + delta)
-        {
-            peaks.push_back(i);
+            onsets.push_back(i * hopSize);
         }
     }
-    
-    // --- 4. Post-processing: apply wait time ---
-    if (peaks.empty() || wait <= 0)
-    {
-        // Convert frames to samples for the final output
-        std::vector<int> onset_samples;
-        onset_samples.reserve(peaks.size());
-        for (int frame : peaks)
-        {
-            onset_samples.push_back(frame * hopSize);
-        }
-        return onset_samples;
-    }
-
-    std::vector<int> final_peaks;
-    final_peaks.push_back(peaks[0]);
-
-    for (size_t i = 1; i < peaks.size(); ++i)
-    {
-        if (peaks[i] - final_peaks.back() > wait)
-        {
-            final_peaks.push_back(peaks[i]);
-        }
-        else if (normalizedEnvelope[peaks[i]] > normalizedEnvelope[final_peaks.back()])
-        {
-            // If a new peak is found within the refractory period,
-            // replace the previous one if it's larger
-            final_peaks.back() = peaks[i];
-        }
-    }
-    
-    // Convert final peak frames to samples
-    std::vector<int> onset_samples;
-    onset_samples.reserve(final_peaks.size());
-    for (int frame : final_peaks)
-    {
-        onset_samples.push_back(frame * hopSize);
-    }
-    
-    return onset_samples;
+    return onsets;
 }
 
 
-float AudioAnalysis::estimateTempo(const std::vector<float>& onsetEnvelope, float start_bpm, float std_bpm, float ac_size, float max_tempo)
+float AudioAnalysis::estimateTempo(const std::vector<float>& onsetEnvelope, float sampleRate, int hopSize)
 {
     if (onsetEnvelope.empty()) return 120.0f;
 
-    // --- Dynamic Window Size Calculation (matches librosa.time_to_frames) ---
-    int acWinSizeFrames = static_cast<int>(std::round(ac_size * sampleRate / hopSize));
-    lastTempogram = calculateTempogram(onsetEnvelope, acWinSizeFrames);
+    // // --- Preprocessing: Median filtering to enhance the main pulse ---
+    // std::vector<float> processedEnvelope = onsetEnvelope;
+    // const int medianFilterSize = 7; // A small, odd-sized window
+    // if (processedEnvelope.size() > medianFilterSize)
+    // {
+    //     std::vector<float> temp(medianFilterSize);
+    //     for (size_t i = medianFilterSize / 2; i < processedEnvelope.size() - medianFilterSize / 2; ++i)
+    //     {
+    //         for (int j = 0; j < medianFilterSize; ++j)
+    //         {
+    //             temp[j] = onsetEnvelope[i + j - medianFilterSize / 2];
+    //         }
+    //         std::sort(temp.begin(), temp.end());
+    //         processedEnvelope[i] = temp[medianFilterSize / 2];
+    //     }
+    // }
+
+    std::vector<float> processedEnvelope = onsetEnvelope;
+
+    // --- Tempogram Calculation and Aggregation ---
+    // Instead of a single global autocorrelation, we compute a tempogram (local
+    // autocorrelations over time) and average it. This gives a much more
+    // stable representation of the song's overall rhythm.
+    const int acWinSizeFrames = 384; // Corresponds to ~8.9s, librosa's default
+    lastTempogram = calculateTempogram(processedEnvelope, acWinSizeFrames);
 
     if (lastTempogram.empty()) return 120.0f;
 
-    // --- Aggregate Tempogram (matches aggregate=np.mean) ---
-    const size_t numLags = lastTempogram.size();
-    const size_t numFrames = numLags > 0 ? lastTempogram[0].size() : 0;
-    
-    std::vector<float> globalAcf(numLags, 0.0f);
-    if (numFrames > 0)
+    std::vector<float> globalAcf(acWinSizeFrames, 0.0f);
+    for (const auto& frameAcf : lastTempogram)
     {
-        for(size_t lag = 0; lag < numLags; ++lag)
+        for (int i = 0; i < acWinSizeFrames; ++i)
         {
-            for(size_t t = 0; t < numFrames; ++t)
-            {
-                globalAcf[lag] += lastTempogram[lag][t];
-            }
-            globalAcf[lag] /= (float)numFrames;
+            globalAcf[i] += frameAcf[i];
         }
     }
-    
+    float numFrames = static_cast<float>(lastTempogram.size());
+    for (float& val : globalAcf)
+    {
+        val /= numFrames;
+    }
     lastGlobalAcf = globalAcf; // Store for UI
 
-    // --- Librosa-style psychoacoustic tempo weighting (Static Prior) ---
-    // (matches librosa.tempo_frequencies)
-    std::vector<float> bpms(numLags, 0.0f);
-    for(size_t i = 1; i < numLags; ++i)
-    {
-        bpms[i] = 60.0f * (float)sampleRate / ((float)hopSize * i);
-    }
+    // --- Tempo Estimation via raw autocorrelation peak picking on the aggregated ACF ---
+    const int originalSize = acWinSizeFrames;
 
-    // Create a log-normal prior centered at start_bpm (matches librosa default prior)
-    std::vector<float> logprior(numLags, -std::numeric_limits<float>::infinity());
-    for(size_t i = 1; i < numLags; ++i)
-    {
-        if (bpms[i] > 0)
-        {
-            float log2_diff = std::log2(bpms[i]) - std::log2(start_bpm);
-            logprior[i] = -0.5f * std::pow(log2_diff / std_bpm, 2.0f);
-        }
-    }
-    
-    // Kill everything above max_tempo
-    if (max_tempo > 0)
-    {
-        for (size_t i = 1; i < numLags; ++i)
-        {
-            if (bpms[i] >= max_tempo)
-            {
-                logprior[i] = -std::numeric_limits<float>::infinity();
-            }
-        }
-    }
-    
-    // Find the peak in the aggregated ACF, weighted by the prior.
-    // (matches np.log1p(1e6 * tg) + logprior)
+    // 1. Define plausible tempo range in terms of lag frames
+    float framesPerSecond = sampleRate / hopSize;
+    int minLag = static_cast<int>(framesPerSecond * 60.0f / 200.0f); // Max tempo 200 BPM
+    int maxLag = static_cast<int>(framesPerSecond * 60.0f / 55.0f);   // Min tempo 55 BPM
+    maxLag = std::min(maxLag, originalSize - 1);
+    minLag = std::max(1, minLag);
+
+    if (minLag >= maxLag) return 120.0f;
+
+    float acf_norm = globalAcf[0];
+    if (acf_norm <= 0) acf_norm = 1.0f;
+
+    // --- Find the strongest peak in the aggregated autocorrelation ---
     int bestLag = -1;
-    float maxWeightedVal = -std::numeric_limits<float>::infinity();
-
-    for (size_t lag = 1; lag < numLags; ++lag) // Start from 1, lag 0 is not useful for tempo
+    float maxAcfVal = -1.0f;
+    for (int lag = minLag; lag <= maxLag; ++lag)
     {
-        // The tempogram is already normalized per-frame in calculateTempogram,
-        // so we use the aggregated value directly without re-normalizing.
-        float weighted_val = std::log1p(globalAcf[lag] * 1e6f) + logprior[lag];
-
-        if (weighted_val > maxWeightedVal)
+        float currentVal = globalAcf[lag] / acf_norm;
+        if (currentVal > maxAcfVal)
         {
-            maxWeightedVal = weighted_val;
+            maxAcfVal = currentVal;
             bestLag = lag;
         }
     }
 
     if (bestLag > 0)
     {
-        return bpms[bestLag];
+        float tempo = 60.0f * framesPerSecond / bestLag;
+        return tempo;
     }
 
     return 120.0f; // Fallback tempo
@@ -472,89 +260,59 @@ float AudioAnalysis::estimateTempo(const std::vector<float>& onsetEnvelope, floa
 
 std::vector<std::vector<float>> AudioAnalysis::calculateTempogram(const std::vector<float>& onsetEnvelope, int winLength)
 {
-    // A 1:1 port of librosa.feature.tempogram
-    if (onsetEnvelope.empty()) return {};
+    if (onsetEnvelope.empty() || winLength < 1) return {};
 
-    const int n = onsetEnvelope.size();
-    const int padding = winLength / 2;
-
-    // 1. Pad the onset envelope with a linear ramp (as numpy.pad with end_values=0)
-    std::vector<float> paddedEnvelope(n + 2 * padding, 0.0f);
-    // Left pad (np.linspace(0, oenv[0], num=padding, endpoint=False))
-    float firstVal = onsetEnvelope.empty() ? 0.0f : onsetEnvelope[0];
-    for (int i = 0; i < padding; ++i)
-    {
-        paddedEnvelope[i] = firstVal * (float)i / (float)padding;
-    }
-
-    // Copy original data
+    // 1. Pad the onset envelope to center the analysis windows (zero-padding)
+    int padding = winLength / 2;
+    std::vector<float> paddedEnvelope(onsetEnvelope.size() + 2 * padding, 0.0f);
     std::copy(onsetEnvelope.begin(), onsetEnvelope.end(), paddedEnvelope.begin() + padding);
 
-    // Right pad (np.linspace(oenv[-1], 0, num=padding, endpoint=False))
-    float lastVal = onsetEnvelope.empty() ? 0.0f : onsetEnvelope.back();
-    for (int i = 0; i < padding; ++i)
+    // 2. Create the windowing function
+    std::vector<float> hanningWindow(winLength);
+    for (int i = 0; i < winLength; ++i)
     {
-        paddedEnvelope[padding + n + i] = lastVal * (float)(padding - i) / (float)padding;
+        hanningWindow[i] = 0.5f - 0.5f * std::cos(2.0f * M_PI * i / (winLength - 1));
     }
 
-    // 2. Create the autocorrelation window (Hann)
-    std::vector<float> acWindow(winLength);
-    for(int i = 0; i < winLength; ++i) {
-        acWindow[i] = 0.5f - 0.5f * std::cos(2.0f * M_PI * i / (winLength - 1));
-    }
+    // 3. Slide over the padded envelope and compute local autocorrelation for each frame
+    std::vector<std::vector<float>> tempogram;
+    int numFrames = onsetEnvelope.size();
+    tempogram.reserve(numFrames);
 
-    // Prepare for autocorrelation via FFT
-    const int fftSize = juce::nextPowerOfTwo(winLength) * 2;
+    const int fftSize = juce::nextPowerOfTwo(winLength * 2);
     juce::dsp::FFT fft(log2(fftSize));
-    
-    // Librosa's tempogram is [lag][time], so we match that layout
-    std::vector<std::vector<float>> tempogram(winLength, std::vector<float>(n, 0.0f));
 
-    // 3. Slide over the padded envelope, frame by frame
-    for (int i = 0; i < n; ++i)
+    for (int i = 0; i < numFrames; ++i)
     {
-        // Use a complex buffer for the FFT. JUCE expects [real, imag, real, imag, ...]
-        std::vector<float> complexFrame(fftSize * 2, 0.0f);
-        
-        // 4. Extract and window the frame, placing it in the real part of the complex buffer
-        for(int j=0; j < winLength; ++j) {
-            complexFrame[j*2] = paddedEnvelope[i+j] * acWindow[j];
-        }
-
-        // 5. Autocorrelation via FFT
-        // a) Forward FFT
-        fft.perform(reinterpret_cast<juce::dsp::Complex<float>*>(complexFrame.data()),
-                    reinterpret_cast<juce::dsp::Complex<float>*>(complexFrame.data()),
-                    false);
-        
-        // b) Compute power spectrum (S * conj(S) = |S|^2) and store it as a real signal for IFFT
-        for (int j = 0; j < fftSize; ++j)
+        // The frame starts at i in the padded envelope, which corresponds to the
+        // original onset frame being at the center of the window.
+        std::vector<float> frame(winLength);
+        for(int j=0; j<winLength; ++j)
         {
-            float real = complexFrame[j*2];
-            float imag = complexFrame[j*2+1];
-            complexFrame[j*2] = real * real + imag * imag; // Magnitude squared in the real part
-            complexFrame[j*2+1] = 0.0f;                   // Zero out the imaginary part
+            frame[j] = paddedEnvelope[i+j] * hanningWindow[j];
         }
 
-        // c) Inverse FFT of the power spectrum gives the autocorrelation
-        fft.perform(reinterpret_cast<juce::dsp::Complex<float>*>(complexFrame.data()),
-                    reinterpret_cast<juce::dsp::Complex<float>*>(complexFrame.data()),
-                    true);
+        // --- Autocorrelation via FFT ---
+        using Complex = juce::dsp::Complex<float>;
+        std::vector<Complex> fftInput(fftSize, Complex{0.0f, 0.0f});
+        std::vector<Complex> fftOutput(fftSize);
+
+        for(size_t j = 0; j < frame.size(); ++j)
+            fftInput[j].real(frame[j]);
+
+        fft.perform(fftInput.data(), fftOutput.data(), false);
+
+        for(int j = 0; j < fftSize; ++j)
+            fftOutput[j] = fftOutput[j] * std::conj(fftOutput[j]);
         
-        // 6. Normalize and store
-        // The result of the IFFT is in the real parts of the complex data.
-        float maxVal = 0.0f;
-        for (int j = 0; j < winLength; ++j) {
-            maxVal = std::max(maxVal, std::abs(complexFrame[j*2]));
-        }
+        fft.perform(fftOutput.data(), fftInput.data(), true);
 
-        if (maxVal > 0)
+        std::vector<float> acf(winLength);
+        for(int j=0; j<winLength; ++j)
         {
-            for (int j = 0; j < winLength; ++j)
-            {
-                tempogram[j][i] = complexFrame[j*2] / maxVal;
-            }
+            acf[j] = fftInput[j].real();
         }
+        tempogram.push_back(acf);
     }
 
     return tempogram;
@@ -682,24 +440,15 @@ void AudioAnalysis::trimBeats(const std::vector<float>& localScore, std::vector<
 }
 
 
-std::vector<double> AudioAnalysis::findBeats(const std::vector<float>& onsetEnvelope, float bpm, double tightness, bool trim)
+std::vector<double> AudioAnalysis::findBeats(const std::vector<float>& onsetEnvelope, float bpm, float sampleRate, int hopSize, double tightness)
 {
     if (onsetEnvelope.empty() || bpm <= 0)
     {
         return {};
     }
 
-    // Check if there's any signal in the onset envelope (matches !onset_envelope.any())
-    float onset_sum = 0.0f;
-    for (float val : onsetEnvelope) {
-        onset_sum += val;
-    }
-    if (onset_sum < 1e-8) {
-        return {};
-    }
-
     // Convert BPM to period in frames
-    double framesPerSecond = this->sampleRate / this->hopSize;
+    double framesPerSecond = sampleRate / hopSize;
     double period = framesPerSecond * 60.0 / bpm;
 
     // --- Create a tempo-synchronized local score (Librosa's key improvement) ---
@@ -770,20 +519,17 @@ std::vector<double> AudioAnalysis::findBeats(const std::vector<float>& onsetEnve
     // Convert onset frames to sample frames
     std::vector<int> beatSampleFrames;
     for (int frame : beatFrames) {
-        beatSampleFrames.push_back(frame * this->hopSize);
+        beatSampleFrames.push_back(frame * hopSize);
     }
     
-    // --- Trim weak leading/trailing beats (conditional) ---
-    if (trim)
-    {
-        trimBeats(localScore, beatSampleFrames, this->hopSize);
-    }
+    // --- Trim weak leading/trailing beats ---
+    trimBeats(localScore, beatSampleFrames, hopSize);
 
     // Convert frames to seconds
     std::vector<double> beatTimes;
     for(int frame : beatSampleFrames)
     {
-        beatTimes.push_back(static_cast<double>(frame) / this->sampleRate);
+        beatTimes.push_back(static_cast<double>(frame) / sampleRate);
     }
 
     return beatTimes;
