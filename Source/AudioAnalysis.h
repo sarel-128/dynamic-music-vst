@@ -48,6 +48,7 @@ public:
     std::vector<std::vector<float>> concatenateMFCCsByBeats(const std::vector<std::vector<float>>& allMfccs, const std::vector<double>& beats, double sampleRate, int hopSize);
     std::vector<std::vector<float>> createSimilarityMatrix(const std::vector<std::vector<float>>& mfccs);
     float calculateSpearmanCorrelation(const std::vector<float>& x, const std::vector<float>& y);
+    std::vector<std::vector<float>> smoothSimilarityMatrix(const std::vector<std::vector<float>>& matrix, int windowSize);
 
     // Public getter for the last calculated tempogram
     const std::vector<std::vector<float>>& getLastTempogram() const { return lastTempogram; }

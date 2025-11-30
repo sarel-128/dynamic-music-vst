@@ -1051,8 +1051,72 @@ std::vector<std::vector<float>> AudioAnalysis::createSimilarityMatrix(const std:
     }
 
     DBG("  2. Calculate Correlation Matrix: " << juce::String(juce::Time::getMillisecondCounterHiRes() - timer, 2) << " ms");
+    timer = juce::Time::getMillisecondCounterHiRes();
+    
+    // --- 3. Apply temporal smoothing ---
+    auto smoothedMatrix = smoothSimilarityMatrix(similarityMatrix, 2);
+    
+    DBG("  3. Temporal Smoothing: " << juce::String(juce::Time::getMillisecondCounterHiRes() - timer, 2) << " ms");
 
-    return similarityMatrix;
+    return smoothedMatrix;
+}
+
+std::vector<std::vector<float>> AudioAnalysis::smoothSimilarityMatrix(const std::vector<std::vector<float>>& matrix, int windowSize)
+{
+    int n = matrix.size();
+    if (n == 0 || windowSize <= 1) return matrix;
+
+    auto smoothedMatrix = matrix; // Start with a copy
+
+    // Iterate over each diagonal. A diagonal is defined by a constant difference between row and column indices (i - j = d).
+    // The difference 'd' ranges from -(n-1) (top-right) to (n-1) (bottom-left).
+    for (int d = -(n - 1); d < n; ++d)
+    {
+        // 1. Extract the values and coordinates of the current diagonal
+        std::vector<float> diagonalValues;
+        std::vector<std::pair<int, int>> diagonalCoords;
+        for (int i = 0; i < n; ++i)
+        {
+            int j = i - d;
+            if (j >= 0 && j < n)
+            {
+                diagonalValues.push_back(matrix[i][j]);
+                diagonalCoords.emplace_back(i, j);
+            }
+        }
+
+        if (diagonalValues.size() < 2) continue; // Not enough elements to smooth
+
+        // 2. Apply a simple moving average with the given window size
+        std::vector<float> smoothedDiagonal = diagonalValues; // Copy to store results
+        for (size_t i = 0; i < diagonalValues.size(); ++i)
+        {
+            float sum = 0.0f;
+            int count = 0;
+            // The window extends from (i - windowSize + 1) to i
+            for (int k = 0; k < windowSize; ++k)
+            {
+                int index = (int)i - k;
+                if (index >= 0 && index < (int)diagonalValues.size())
+                {
+                    sum += diagonalValues[index];
+                    count++;
+                }
+            }
+            if (count > 0)
+            {
+                smoothedDiagonal[i] = sum / count;
+            }
+        }
+
+        // 3. Place the smoothed values back into the result matrix
+        for (size_t i = 0; i < diagonalCoords.size(); ++i)
+        {
+            smoothedMatrix[diagonalCoords[i].first][diagonalCoords[i].second] = smoothedDiagonal[i];
+        }
+    }
+
+    return smoothedMatrix;
 }
 
 float AudioAnalysis::calculateSpearmanCorrelation(const std::vector<float>& x, const std::vector<float>& y)
