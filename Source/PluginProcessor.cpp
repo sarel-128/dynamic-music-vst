@@ -138,6 +138,8 @@ void DynamicMusicVstAudioProcessor::loadAudioFile(const juce::File& file)
     auto* reader = formatManager.createReaderFor(file);
     if (reader != nullptr)
     {
+        fileSampleRate = reader->sampleRate; // Store the file's sample rate
+
         // Store the full audio file in our source buffer for analysis
         sourceAudioBuffer.setSize((int)reader->numChannels, (int)reader->lengthInSamples);
         reader->read(&sourceAudioBuffer,
@@ -260,10 +262,10 @@ void DynamicMusicVstAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         fileTransportSource.getNextAudioBlock(channelInfo);
     }
         
-    if (analysisState == AnalysisState::AnalysisNeeded)
-    {
+    // --- Analysis ---
+    if (analysisState == AnalysisState::AnalysisNeeded) {
         analysisState = AnalysisState::Analyzing;
-        
+
         DBG(" ");
         DBG("Starting analysis...");
         auto analysisStartTime = juce::Time::getMillisecondCounterHiRes();
@@ -294,15 +296,16 @@ void DynamicMusicVstAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
 
         // --- Real Analysis ---
         auto stepStartTime = juce::Time::getMillisecondCounterHiRes();
-        auto onsetEnvelope = audioAnalyser.getOnsetStrengthEnvelope(analysisBuffer);
+        const int onsetHopSize = 512; // Use a consistent hop size for onset/beat analysis
+        onsetEnvelope = audioAnalyser.getOnsetStrengthEnvelope(analysisBuffer, fileSampleRate, onsetHopSize);
         DBG("1. Onset Strength Envelope: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
 
         stepStartTime = juce::Time::getMillisecondCounterHiRes();
-        auto onsets = audioAnalyser.detectOnsets(onsetEnvelope);
+        auto onsets = audioAnalyser.detectOnsets(onsetEnvelope, onsetHopSize);
         DBG("2. Detect Onsets: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
 
         stepStartTime = juce::Time::getMillisecondCounterHiRes();
-        estimatedBPM = audioAnalyser.estimateTempo(onsetEnvelope, getSampleRate(), 256);
+        estimatedBPM = audioAnalyser.estimateTempo(onsetEnvelope, fileSampleRate, onsetHopSize);
         tempogram = audioAnalyser.getLastTempogram();
         globalAcf = audioAnalyser.getLastGlobalAcf(); // Store aggregated profile for the UI
         DBG("3. Estimate Tempo: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
@@ -311,19 +314,19 @@ void DynamicMusicVstAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         
         // Beat timestamps are relative to the start of the analysisBuffer
         stepStartTime = juce::Time::getMillisecondCounterHiRes();
-        auto relativeBeatTimestamps = audioAnalyser.findBeats(onsetEnvelope, estimatedBPM, getSampleRate(), 256, tightnessValue);
+        auto relativeBeatTimestamps = audioAnalyser.findBeats(onsetEnvelope, estimatedBPM, fileSampleRate, onsetHopSize, tightnessValue);
         DBG("4. Find Beats: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
         
         // --- Calculate MFCCs and Similarity Matrix ---
         if (!relativeBeatTimestamps.empty())
         {
-            const int hopSize = 256;
+            const int mfccHopSize = 256;
             stepStartTime = juce::Time::getMillisecondCounterHiRes();
-            auto allMfccs = audioAnalyser.calculateMFCCs(analysisBuffer, getSampleRate());
+            auto allMfccs = audioAnalyser.calculateMFCCs(analysisBuffer, fileSampleRate);
             DBG("5. Calculate MFCCs: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
 
             stepStartTime = juce::Time::getMillisecondCounterHiRes();
-            auto concatenatedMfccs = audioAnalyser.concatenateMFCCsByBeats(allMfccs, relativeBeatTimestamps, getSampleRate(), hopSize);
+            auto concatenatedMfccs = audioAnalyser.concatenateMFCCsByBeats(allMfccs, relativeBeatTimestamps, fileSampleRate, mfccHopSize);
             DBG("6. Concatenate MFCCs by Beats: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
 
             stepStartTime = juce::Time::getMillisecondCounterHiRes();
@@ -363,7 +366,7 @@ void DynamicMusicVstAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
                 remixMap.push_back({i * chunkSize, chunkSize});
             }
         }
-        float currentDuration = (float)analysisBuffer.getNumSamples() / getSampleRate();
+        float currentDuration = (float)analysisBuffer.getNumSamples() / fileSampleRate;
         if (currentDuration > 0) {
             float targetDuration = *parameters.getRawParameterValue("targetDuration");
             if (currentDuration > targetDuration && !remixMap.empty()) {

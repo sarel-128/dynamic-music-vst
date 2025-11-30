@@ -70,8 +70,11 @@ public:
     std::vector<std::vector<float>> similarityMatrix;
     std::vector<std::vector<float>> tempogram;
     std::vector<float> globalAcf;
+    std::vector<float> onsetEnvelope;
 
 private:
+    double fileSampleRate = 44100.0; // Default, will be updated on file load
+    
     // --- Metronome Click Synthesis ---
     double clickFrequency { 1000.0 };
     double clickDurationSecs { 0.05 };

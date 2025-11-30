@@ -59,6 +59,90 @@ private:
 };
 
 //==============================================================================
+class OnsetEnvelopeDisplay : public juce::Component
+{
+public:
+    OnsetEnvelopeDisplay() = default;
+
+    void paint(juce::Graphics& g) override
+    {
+        g.fillAll(juce::Colours::black);
+
+        if (onsetEnvelope.empty())
+        {
+            g.setColour(juce::Colours::white);
+            g.drawText("No Onset Envelope Data", getLocalBounds(), juce::Justification::centred, false);
+            return;
+        }
+
+        g.setColour(juce::Colours::yellow);
+
+        auto maxValue = *std::max_element(onsetEnvelope.begin(), onsetEnvelope.end());
+        if (maxValue <= 0) maxValue = 1.0f;
+
+        juce::Path path;
+        path.startNewSubPath(0, getHeight());
+
+        for (int i = 0; i < onsetEnvelope.size(); ++i)
+        {
+            auto x = (float)i / (float)(onsetEnvelope.size() - 1) * getWidth();
+            auto y = getHeight() - (onsetEnvelope[i] / maxValue) * getHeight();
+            path.lineTo(x, y);
+        }
+        
+        path.lineTo(getWidth(), getHeight());
+        path.closeSubPath();
+        
+        g.setColour(juce::Colours::yellow.withAlpha(0.5f));
+        g.fillPath(path);
+        
+        g.setColour(juce::Colours::yellow);
+        g.strokePath(path, juce::PathStrokeType(1.0f));
+
+        // Draw beat markers
+        if (totalDuration > 0 && !beatTimestamps.empty())
+        {
+            g.setColour(juce::Colours::cyan.withAlpha(0.7f));
+            for (const auto& timestamp : beatTimestamps)
+            {
+                float x = (float)(timestamp / totalDuration) * getWidth();
+                g.drawVerticalLine(juce::roundToInt(x), 0.0f, (float)getHeight());
+            }
+        }
+
+        // Draw playhead
+        g.setColour(juce::Colours::red.withAlpha(0.7f));
+        float xPosition = playheadPosition * getWidth();
+        g.drawVerticalLine(juce::roundToInt(xPosition), 0.0f, (float)getHeight());
+    }
+
+    void updateOnsetEnvelope(const std::vector<float>& newEnvelope)
+    {
+        onsetEnvelope = newEnvelope;
+        repaint();
+    }
+
+    void updateBeatInfo(const std::vector<double>& newBeatTimestamps, double newTotalDuration)
+    {
+        beatTimestamps = newBeatTimestamps;
+        totalDuration = newTotalDuration;
+        repaint();
+    }
+
+    void setPlayheadPosition(float newPosition)
+    {
+        playheadPosition = juce::jlimit(0.0f, 1.0f, newPosition);
+        repaint();
+    }
+
+private:
+    std::vector<float> onsetEnvelope;
+    std::vector<double> beatTimestamps;
+    double totalDuration = 0.0;
+    float playheadPosition = 0.0f;
+};
+
+//==============================================================================
 class TempogramDisplayComponent : public juce::Component
 {
 public:
@@ -298,6 +382,7 @@ private:
     
     WaveformDisplay waveformDisplay;
     SimilarityMatrixComponent similarityMatrixDisplay;
+    OnsetEnvelopeDisplay onsetEnvelopeDisplay;
     TempogramDisplayComponent tempogramDisplay;
     juce::Slider targetDurationSlider;
     juce::Slider beatTightnessSlider;

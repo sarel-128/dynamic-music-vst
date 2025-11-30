@@ -12,6 +12,9 @@ DynamicMusicVstAudioProcessorEditor::DynamicMusicVstAudioProcessorEditor (Dynami
     // Similarity Matrix Display
     addAndMakeVisible(similarityMatrixDisplay);
 
+    // Onset Envelope Display
+    addAndMakeVisible(onsetEnvelopeDisplay);
+
     // Tempogram Display
     addAndMakeVisible(tempogramDisplay);
 
@@ -137,6 +140,7 @@ void DynamicMusicVstAudioProcessorEditor::timerCallback()
 
     auto playheadRatio = audioProcessor.getTotalLengthSecs() > 0 ? (float)audioProcessor.getCurrentPositionSecs() / (float)audioProcessor.getTotalLengthSecs() : 0.0f;
     similarityMatrixDisplay.setPlayheadPosition(playheadRatio);
+    onsetEnvelopeDisplay.setPlayheadPosition(playheadRatio);
     tempogramDisplay.setPlayheadPosition(playheadRatio);
 
     if (audioProcessor.getTotalLengthSecs() > 0)
@@ -170,7 +174,9 @@ void DynamicMusicVstAudioProcessorEditor::timerCallback()
             tempoLabel.setText("BPM: " + juce::String(audioProcessor.estimatedBPM, 1), juce::dontSendNotification);
             similarityMatrixDisplay.updateBeatInfo(audioProcessor.beatTimestamps, audioProcessor.getTotalLengthSecs());
             similarityMatrixDisplay.updateMatrix(audioProcessor.similarityMatrix);
-            tempogramDisplay.updateDisplayInfo(audioProcessor.tempogram, audioProcessor.globalAcf, audioProcessor.getSampleRate(), 256);
+            onsetEnvelopeDisplay.updateOnsetEnvelope(audioProcessor.onsetEnvelope);
+            onsetEnvelopeDisplay.updateBeatInfo(audioProcessor.beatTimestamps, audioProcessor.getTotalLengthSecs());
+            tempogramDisplay.updateDisplayInfo(audioProcessor.tempogram, audioProcessor.globalAcf, audioProcessor.getSampleRate(), 512);
             audioProcessor.analysisState = DynamicMusicVstAudioProcessor::AnalysisState::Ready; // Reset state
             break;
     }
@@ -200,6 +206,7 @@ void DynamicMusicVstAudioProcessorEditor::resized()
     juce::FlexBox plotsBox;
     plotsBox.flexDirection = juce::FlexBox::Direction::column;
     plotsBox.items.add(juce::FlexItem(similarityMatrixDisplay).withHeight(plotsBounds.getWidth()));
+    plotsBox.items.add(juce::FlexItem(onsetEnvelopeDisplay).withHeight(120).withMargin(juce::FlexItem::Margin(5, 0, 0, 0)));
     plotsBox.items.add(juce::FlexItem(tempogramDisplay).withHeight(120).withMargin(juce::FlexItem::Margin(5, 0, 0, 0)));
     plotsBox.items.add(juce::FlexItem(waveformDisplay).withHeight(80).withMargin(juce::FlexItem::Margin(5, 0, 0, 0)));
     plotsBox.performLayout(plotsBounds);
