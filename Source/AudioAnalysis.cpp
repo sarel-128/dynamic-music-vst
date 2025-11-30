@@ -72,6 +72,92 @@ void AudioAnalysis::createMelFilterbank(int numBands, int fftSize, double sample
     }
 }
 
+const std::vector<std::vector<float>>& AudioAnalysis::getPowerMelSpectrogram(const juce::AudioBuffer<float>& buffer, double sampleRate, int fftSize, int hopSize)
+{
+    const auto* audioData = buffer.getReadPointer(0);
+    int numSamples = buffer.getNumSamples();
+
+    // --- 1. Check if the cache is valid ---
+    bool isCacheValid = !cachedPowerMelSpectrogram.empty() &&
+                        cachedFftSize == fftSize &&
+                        cachedHopSize == hopSize &&
+                        cachedSampleRate == sampleRate &&
+                        cachedAudioDataPtr == audioData &&
+                        cachedNumSamples == numSamples;
+    
+    if (isCacheValid)
+    {
+        return cachedPowerMelSpectrogram;
+    }
+
+    // --- 2. If cache is invalid, calculate the Mel spectrogram from scratch ---
+    // Recalculate Mel filterbank if needed
+    // Note: nBands is coming from a member variable `lastNbands` which is set in getOnsetStrengthEnvelope.
+    // This assumes getOnsetStrengthEnvelope is called before any other spectrogram-related function that might need a different nBands.
+    if (melFilterbank.empty() || lastFftSize != fftSize || lastSampleRate != sampleRate)
+    {
+        createMelFilterbank(lastNbands, fftSize, sampleRate);
+        lastFftSize = fftSize;
+        lastSampleRate = sampleRate;
+    }
+
+    juce::dsp::FFT fft(log2(fftSize));
+
+    const int padding = fftSize / 2;
+    std::vector<float> paddedAudio(numSamples + 2 * padding);
+    // Left pad
+    for (int i = 0; i < padding; ++i) { paddedAudio[i] = audioData[padding - 1 - i]; }
+    // Copy original
+    std::copy(audioData, audioData + numSamples, paddedAudio.begin() + padding);
+    // Right pad
+    for (int i = 0; i < padding; ++i) { paddedAudio[padding + numSamples + i] = audioData[numSamples - 1 - i]; }
+
+    const float* paddedAudioData = paddedAudio.data();
+    const int numPaddedSamples = paddedAudio.size();
+    
+    std::vector<float> window(fftSize);
+    for(int j = 0; j < fftSize; ++j) {
+        window[j] = 0.5f - 0.5f * std::cos(2.0f * M_PI * j / (fftSize - 1));
+    }
+    
+    // Clear and reserve cache space
+    cachedPowerMelSpectrogram.clear();
+    cachedPowerMelSpectrogram.reserve((numPaddedSamples - fftSize) / hopSize + 1);
+    
+    // Calculate Mel power spectrogram
+    for (int i = 0; i + fftSize <= numPaddedSamples; i += hopSize)
+    {
+        std::vector<float> fftBuffer(fftSize * 2, 0.0f);
+        for(int j=0; j<fftSize; ++j) {
+            fftBuffer[j] = paddedAudioData[i+j] * window[j];
+        }
+
+        fft.performFrequencyOnlyForwardTransform(fftBuffer.data());
+        
+        for (size_t k = 0; k < fftSize / 2 + 1; ++k) {
+            fftBuffer[k] = fftBuffer[k] * fftBuffer[k]; // Power = magnitude^2
+        }
+
+        std::vector<float> currentMelFrame(melFilterbank.size(), 0.0f);
+        for (size_t band = 0; band < melFilterbank.size(); ++band)
+        {
+            for (const auto& binWeightPair : melFilterbank[band])
+            {
+                currentMelFrame[band] += fftBuffer[binWeightPair.first] * binWeightPair.second;
+            }
+        }
+        cachedPowerMelSpectrogram.push_back(currentMelFrame);
+    }
+
+    // --- 3. Update cache validity info ---
+    cachedFftSize = fftSize;
+    cachedHopSize = hopSize;
+    cachedSampleRate = sampleRate;
+    cachedAudioDataPtr = audioData;
+    cachedNumSamples = numSamples;
+    
+    return cachedPowerMelSpectrogram;
+}
 
 std::vector<float> AudioAnalysis::getOnsetStrengthEnvelope(const juce::AudioBuffer<float>& buffer,
                                                            double sampleRate,
@@ -82,80 +168,15 @@ std::vector<float> AudioAnalysis::getOnsetStrengthEnvelope(const juce::AudioBuff
                                                            int max_size,
                                                            AggregationMethod aggregate)
 {
-    // --- Recalculate Mel filterbank if parameters have changed ---
-    if (nBands != lastNbands || fftSize != lastFftSize || sampleRate != lastSampleRate)
-    {
-        createMelFilterbank(nBands, fftSize, sampleRate);
-        lastNbands = nBands;
-        lastFftSize = fftSize;
-        lastSampleRate = sampleRate;
-    }
+    // --- Update last known nBands, as it's used by the shared getPowerMelSpectrogram ---
+    lastNbands = nBands;
 
-    juce::dsp::FFT fft(log2(fftSize));
-    const auto* audioData = buffer.getReadPointer(0);
-    int numSamples = buffer.getNumSamples();
-
-    // --- Librosa-style Reflection Padding ---
-    const int padding = fftSize / 2;
-    std::vector<float> paddedAudio(numSamples + 2 * padding);
-
-    // Left pad
-    for (int i = 0; i < padding; ++i)
-    {
-        paddedAudio[i] = audioData[padding - 1 - i];
-    }
-    // Copy original audio
-    std::copy(audioData, audioData + numSamples, paddedAudio.begin() + padding);
-    // Right pad
-    for (int i = 0; i < padding; ++i)
-    {
-        paddedAudio[padding + numSamples + i] = audioData[numSamples - 1 - i];
-    }
-
-    const float* paddedAudioData = paddedAudio.data();
-    const int numPaddedSamples = paddedAudio.size();
-
-    // Hann window
-    std::vector<float> window(fftSize);
-    for(int j = 0; j < fftSize; ++j) {
-        window[j] = 0.5f - 0.5f * std::cos(2.0f * M_PI * j / (fftSize - 1));
-    }
-
-    // --- 1. Compute Mel Spectrogram and convert to Power dB ---
-    std::vector<std::vector<float>> melSpectrogram;
-    float maxPower = 0.0f;
-
-    // First pass: calculate Mel power spectrogram and find max power
-    for (int i = 0; i + fftSize <= numPaddedSamples; i += hopSize)
-    {
-        std::vector<float> fftBuffer(fftSize * 2, 0.0f);
-        for(int j=0; j<fftSize; ++j) {
-            fftBuffer[j] = paddedAudioData[i+j] * window[j];
-        }
-
-        fft.performFrequencyOnlyForwardTransform(fftBuffer.data());
-        
-        // --- FIX: Convert magnitude to power BEFORE applying Mel filterbank ---
-        for (size_t k = 0; k < fftSize / 2 + 1; ++k) {
-            fftBuffer[k] = fftBuffer[k] * fftBuffer[k];
-        }
-
-        std::vector<float> currentMelFrame(melFilterbank.size(), 0.0f);
-        for (size_t band = 0; band < melFilterbank.size(); ++band)
-        {
-            for (const auto& binWeightPair : melFilterbank[band])
-            {
-                // Sum power spectrogram values
-                currentMelFrame[band] += fftBuffer[binWeightPair.first] * binWeightPair.second;
-            }
-            if (currentMelFrame[band] > maxPower)
-            {
-                maxPower = currentMelFrame[band];
-            }
-        }
-        melSpectrogram.push_back(currentMelFrame);
-    }
+    // --- 1. Get the power Mel spectrogram (from cache or new calculation) ---
+    const auto& powerMelSpectrogram = getPowerMelSpectrogram(buffer, sampleRate, fftSize, hopSize);
     
+    // Make a mutable copy for further processing
+    auto melSpectrogram = powerMelSpectrogram;
+
     // --- Corrected dB Conversion to match Librosa ---
     float amin = 1e-10f;
     float top_db = 80.0f;
@@ -296,10 +317,16 @@ float AudioAnalysis::estimateTempo(const std::vector<float>& onsetEnvelope,
 {
     if (onsetEnvelope.empty() || start_bpm <= 0) return 120.0f;
 
+    DBG("--- estimateTempo breakdown ---");
+    auto timer = juce::Time::getMillisecondCounterHiRes();
+
     // --- 1. Calculate Tempogram ---
     // Calculate window size in frames from ac_size in seconds, matching librosa
     const int win_length = static_cast<int>(std::round(ac_size * sampleRate / hopSize));
     lastTempogram = calculateTempogram(onsetEnvelope, win_length);
+
+    DBG("  calculateTempogram call: " << juce::String(juce::Time::getMillisecondCounterHiRes() - timer, 2) << " ms");
+    timer = juce::Time::getMillisecondCounterHiRes();
 
     if (lastTempogram.empty()) return 120.0f;
 
@@ -327,6 +354,9 @@ float AudioAnalysis::estimateTempo(const std::vector<float>& onsetEnvelope,
         }
     }
     lastGlobalAcf = globalAcf; // Store for UI
+
+    DBG("  Aggregate Tempogram: " << juce::String(juce::Time::getMillisecondCounterHiRes() - timer, 2) << " ms");
+    timer = juce::Time::getMillisecondCounterHiRes();
 
     // --- 3. Calculate BPM values for each bin ---
     std::vector<float> bpms = getTempoFrequencies(win_length, sampleRate, hopSize);
@@ -377,10 +407,12 @@ float AudioAnalysis::estimateTempo(const std::vector<float>& onsetEnvelope,
         }
     } 
 
+    DBG("  Prior & Peak Finding: " << juce::String(juce::Time::getMillisecondCounterHiRes() - timer, 2) << " ms");
+
     // --- 7. Return the estimated tempo ---
     if (best_period_idx > 0)
     {
-        return bpms[best_period_idx]+9.0f;
+        return bpms[best_period_idx];
     }
     
     return 120.0f; // Fallback tempo
@@ -389,6 +421,9 @@ float AudioAnalysis::estimateTempo(const std::vector<float>& onsetEnvelope,
 std::vector<std::vector<float>> AudioAnalysis::calculateTempogram(const std::vector<float>& onsetEnvelope, int winLength)
 {
     if (onsetEnvelope.empty() || winLength < 1) return {};
+
+    DBG("--- calculateTempogram breakdown ---");
+    auto timer = juce::Time::getMillisecondCounterHiRes();
 
     // 1. Pad the onset envelope with a linear ramp to match librosa
     int padding = winLength / 2;
@@ -424,6 +459,9 @@ std::vector<std::vector<float>> AudioAnalysis::calculateTempogram(const std::vec
          paddedEnvelope.insert(paddedEnvelope.end(), padding, 0.0f);
     }
 
+    DBG("  1. Padding: " << juce::String(juce::Time::getMillisecondCounterHiRes() - timer, 2) << " ms");
+    timer = juce::Time::getMillisecondCounterHiRes();
+
     // 2. Create the windowing function
     std::vector<float> hanningWindow(winLength);
     for (int i = 0; i < winLength; ++i)
@@ -431,43 +469,79 @@ std::vector<std::vector<float>> AudioAnalysis::calculateTempogram(const std::vec
         hanningWindow[i] = 0.5f - 0.5f * std::cos(2.0f * M_PI * i / (winLength - 1));
     }
 
+    DBG("  2. Hanning Window: " << juce::String(juce::Time::getMillisecondCounterHiRes() - timer, 2) << " ms");
+    timer = juce::Time::getMillisecondCounterHiRes();
+
     // 3. Slide over the padded envelope and compute local autocorrelation for each frame
     std::vector<std::vector<float>> tempogram;
     int numFrames = onsetEnvelope.size();
     tempogram.reserve(numFrames);
 
     const int fftSize = juce::nextPowerOfTwo(winLength * 2);
-    juce::dsp::FFT fft(log2(fftSize));
+    int fftOrder = static_cast<int>(std::log2(fftSize));
+
+    // Create or resize FFT object and workspaces if necessary
+    if (fftOrder != tempogramfftOrder)
+    {
+        tempogramfft = std::make_unique<juce::dsp::FFT>(fftOrder);
+        tempogramfftOrder = fftOrder;
+        tempogramfftWorkspace1.resize(fftSize);
+        tempogramfftWorkspace2.resize(fftSize);
+    }
+    
+    // Pre-allocate frame and acf buffers outside the loop
+    std::vector<float> frame(winLength);
+    std::vector<float> acf(winLength);
+
 
     for (int i = 0; i < numFrames; ++i)
     {
         // The frame starts at i in the padded envelope, which corresponds to the
         // original onset frame being at the center of the window.
-        std::vector<float> frame(winLength);
-        for(int j=0; j<winLength; ++j)
+        
+        using SIMD = juce::dsp::SIMDRegister<float>;
+        const int numElements = SIMD::SIMDNumElements;
+        const size_t alignment = SIMD::SIMDRegisterSize;
+        const int numSIMDTrips = winLength / numElements;
+
+        for (int j = 0; j < numSIMDTrips * numElements; j += numElements)
         {
-            frame[j] = paddedEnvelope[i+j] * hanningWindow[j];
+            // Use temporary aligned buffers to avoid crashes with unaligned std::vector data
+            alignas(alignment) float envArr[numElements];
+            alignas(alignment) float winArr[numElements];
+            
+            memcpy(envArr, paddedEnvelope.data() + i + j, numElements * sizeof(float));
+            memcpy(winArr, hanningWindow.data() + j, numElements * sizeof(float));
+
+            SIMD envelopeChunk = SIMD::fromRawArray(envArr);
+            SIMD windowChunk   = SIMD::fromRawArray(winArr);
+            
+            (envelopeChunk * windowChunk).copyToRawArray(frame.data() + j);
+        }
+        // Handle remainder
+        for (int j = numSIMDTrips * numElements; j < winLength; ++j)
+        {
+            frame[j] = paddedEnvelope[i + j] * hanningWindow[j];
         }
 
         // --- Autocorrelation via FFT ---
         using Complex = juce::dsp::Complex<float>;
-        std::vector<Complex> fftInput(fftSize, Complex{0.0f, 0.0f});
-        std::vector<Complex> fftOutput(fftSize);
+        std::fill(tempogramfftWorkspace1.begin(), tempogramfftWorkspace1.end(), Complex{0.0f, 0.0f});
+        std::fill(tempogramfftWorkspace2.begin(), tempogramfftWorkspace2.end(), Complex{0.0f, 0.0f});
 
         for(size_t j = 0; j < frame.size(); ++j)
-            fftInput[j].real(frame[j]);
+            tempogramfftWorkspace1[j].real(frame[j]);
 
-        fft.perform(fftInput.data(), fftOutput.data(), false);
+        tempogramfft->perform(tempogramfftWorkspace1.data(), tempogramfftWorkspace2.data(), false);
 
         for(int j = 0; j < fftSize; ++j)
-            fftOutput[j] = fftOutput[j] * std::conj(fftOutput[j]);
+            tempogramfftWorkspace2[j] = tempogramfftWorkspace2[j] * std::conj(tempogramfftWorkspace2[j]);
         
-        fft.perform(fftOutput.data(), fftInput.data(), true);
+        tempogramfft->perform(tempogramfftWorkspace2.data(), tempogramfftWorkspace1.data(), true);
 
-        std::vector<float> acf(winLength);
         for(int j=0; j<winLength; ++j)
         {
-            acf[j] = fftInput[j].real();
+            acf[j] = tempogramfftWorkspace1[j].real();
         }
 
         // --- Normalization ---
@@ -487,6 +561,8 @@ std::vector<std::vector<float>> AudioAnalysis::calculateTempogram(const std::vec
         
         tempogram.push_back(acf);
     }
+
+    DBG("  3. Autocorrelation Loop: " << juce::String(juce::Time::getMillisecondCounterHiRes() - timer, 2) << " ms");
 
     return tempogram;
 }
@@ -728,73 +804,92 @@ std::vector<float> AudioAnalysis::getTempoFrequencies(int numBins, float sampleR
 
 void AudioAnalysis::performDCT(std::vector<float>& input)
 {
-    int N = input.size();
+    const int N = input.size();
     if (N == 0) return;
 
-    std::vector<float> result(N);
-    float c_k_factor = M_PI / N;
+    // --- 1. Setup FFT for DCT calculation ---
+    // We use the relation DCT-II[x] = Re{exp(-j*pi*k/2N) * FFT_2N[x_padded]}
+    // where x is padded with N zeros to make a 2N-length sequence.
+    // The FFT size must be a power of two.
+    int fftSize = juce::nextPowerOfTwo(N * 2);
+    int fftOrder = static_cast<int>(std::log2(fftSize));
+
+    // Create or resize FFT object and workspace if necessary to be efficient
+    if (fftOrder != dctfftOrder)
+    {
+        dctfft = std::make_unique<juce::dsp::FFT>(fftOrder);
+        dctfftOrder = fftOrder;
+        dctfftWorkspace.resize(fftSize);
+    }
+    
+    // --- 2. Prepare input buffer for FFT ---
+    std::fill(dctfftWorkspace.begin(), dctfftWorkspace.end(), juce::dsp::Complex<float>{0.0f, 0.0f});
+    for(int i = 0; i < N; ++i)
+    {
+        dctfftWorkspace[i].real(input[i]);
+    }
+
+    // --- 3. Perform FFT ---
+    dctfft->perform(dctfftWorkspace.data(), dctfftWorkspace.data(), false); // false = forward transform
+
+    // --- 4. Post-twiddle and extract real part to get the DCT sum ---
+    float pi_over_2N = M_PI / (2.0f * N);
+    
+    for (int k = 0; k < N; ++k)
+    {
+        float angle = k * pi_over_2N;
+        // Calculation is: Re{ (FFT_real + j*FFT_imag) * (cos(angle) - j*sin(angle)) }
+        // which simplifies to: FFT_real * cos(angle) + FFT_imag * sin(angle)
+        float real = dctfftWorkspace[k].real();
+        float imag = dctfftWorkspace[k].imag();
+        input[k] = real * std::cos(angle) + imag * std::sin(angle);
+    }
+
+    // --- 5. Apply ortho-normalization to match original implementation ---
     float sqrt_1_N = std::sqrt(1.0f / N);
     float sqrt_2_N = std::sqrt(2.0f / N);
 
-    for (int k = 0; k < N; ++k)
+    if (N > 0)
     {
-        float sum = 0.0f;
-        for (int n = 0; n < N; ++n)
-        {
-            sum += input[n] * std::cos(c_k_factor * (n + 0.5f) * k);
-        }
-        float c_k = (k == 0) ? sqrt_1_N : sqrt_2_N;
-        result[k] = c_k * sum;
+        input[0] *= sqrt_1_N;
     }
-
-    input = result;
+    for (int k = 1; k < N; ++k)
+    {
+        input[k] *= sqrt_2_N;
+    }
 }
 
-std::vector<std::vector<float>> AudioAnalysis::calculateMFCCs(const juce::AudioBuffer<float>& buffer, double sampleRate, int numCoefficients)
+
+std::vector<std::vector<float>> AudioAnalysis::calculateMFCCs(const juce::AudioBuffer<float>& buffer,
+                                                              double sampleRate,
+                                                              int numCoefficients,
+                                                              int fftSize,
+                                                              int hopSize)
 {
-    std::vector<std::vector<float>> allMfccs;
-    const int fftSize = 1024;
-    const int hopSize = 256;
-    juce::dsp::FFT fft(log2(fftSize));
-    auto* audioData = buffer.getReadPointer(0);
-    int numSamples = buffer.getNumSamples();
-
-    // Pre-allocate buffers outside the loop for performance
-    std::vector<float> window(fftSize);
-    std::vector<float> windowedData(fftSize);
-    std::vector<float> fftBuffer(fftSize * 2, 0.0f);
-
-    for(int j=0; j<fftSize; ++j) {
-        window[j] = 0.5f - 0.5f * std::cos(2.0f * M_PI * j / (fftSize - 1));
-    }
-
-    for (int i = 0; i + fftSize <= numSamples; i += hopSize)
+    // --- 1. Get the power Mel spectrogram (from cache or new calculation) ---
+    const auto& powerMelSpectrogram = getPowerMelSpectrogram(buffer, sampleRate, fftSize, hopSize);
+    
+    // --- 2. We now have a power Mel spectrogram. Take the log. ---
+    auto logMelSpectrogram = powerMelSpectrogram; // Make a mutable copy
+    for (auto& frame : logMelSpectrogram)
     {
-        for(int j=0; j<fftSize; ++j) {
-            windowedData[j] = audioData[i+j] * window[j];
-        }
-
-        std::fill(fftBuffer.begin(), fftBuffer.end(), 0.0f);
-        std::copy(windowedData.begin(), windowedData.end(), fftBuffer.begin());
-
-        fft.performFrequencyOnlyForwardTransform(fftBuffer.data());
-
-        std::vector<float> melEnergies(melFilterbank.size(), 0.0f);
-        for (size_t band = 0; band < melFilterbank.size(); ++band)
+        for (auto& val : frame)
         {
-            for (const auto& binWeightPair : melFilterbank[band])
-            {
-                melEnergies[band] += fftBuffer[binWeightPair.first] * binWeightPair.second;
-            }
-            melEnergies[band] = std::log(melEnergies[band] + 1e-6);
+            val = std::log(val + 1e-6f);
         }
-        
-        performDCT(melEnergies);
-
-        melEnergies.resize(numCoefficients);
-        allMfccs.push_back(melEnergies);
     }
 
+    // --- 3. Perform DCT on each frame to get MFCCs ---
+    std::vector<std::vector<float>> allMfccs;
+    allMfccs.reserve(logMelSpectrogram.size());
+
+    for (auto& frame : logMelSpectrogram)
+    {
+        performDCT(frame);
+        frame.resize(numCoefficients);
+        allMfccs.push_back(frame);
+    }
+    
     return allMfccs;
 }
 
@@ -889,6 +984,9 @@ std::vector<std::vector<float>> AudioAnalysis::createSimilarityMatrix(const std:
     int numSlices = mfccs.size();
     if (numSlices == 0) return {};
 
+    DBG("--- createSimilarityMatrix breakdown ---");
+    auto timer = juce::Time::getMillisecondCounterHiRes();
+
     // --- 1. Pre-calculate ranks for all MFCC vectors to avoid redundant work ---
     auto getRanks = [](const std::vector<float>& data) -> std::vector<float> {
         std::vector<int> indices(data.size());
@@ -910,18 +1008,49 @@ std::vector<std::vector<float>> AudioAnalysis::createSimilarityMatrix(const std:
         rankedMfccs.push_back(getRanks(vec));
     }
 
+    DBG("  1. Pre-calculate Ranks: " << juce::String(juce::Time::getMillisecondCounterHiRes() - timer, 2) << " ms");
+    timer = juce::Time::getMillisecondCounterHiRes();
+
     // --- 2. Calculate similarity using the pre-ranked data ---
     std::vector<std::vector<float>> similarityMatrix(numSlices, std::vector<float>(numSlices, 0.0f));
     
-    for (int i = 0; i < numSlices; ++i)
-    {
-        for (int j = i; j < numSlices; ++j)
+    // Determine the number of threads to use
+    const int numThreads = std::max(1u, std::thread::hardware_concurrency());
+    std::vector<std::thread> threads;
+    threads.reserve(numThreads);
+
+    // Define a worker lambda to calculate a portion of the matrix
+    auto worker = [&](int start, int end) {
+        for (int i = start; i < end; ++i)
         {
-            float correlation = calculatePearsonCorrelationOnRanks(rankedMfccs[i], rankedMfccs[j]);
-            similarityMatrix[i][j] = correlation;
-            similarityMatrix[j][i] = correlation; // Matrix is symmetric
+            for (int j = i; j < numSlices; ++j)
+            {
+                float correlation = calculatePearsonCorrelationOnRanks(rankedMfccs[i], rankedMfccs[j]);
+                similarityMatrix[i][j] = correlation;
+                similarityMatrix[j][i] = correlation; // Matrix is symmetric
+            }
+        }
+    };
+
+    // Dispatch the work to the threads
+    int sliceSize = (numSlices + numThreads - 1) / numThreads;
+    for (int i = 0; i < numThreads; ++i)
+    {
+        int start = i * sliceSize;
+        int end = std::min(start + sliceSize, numSlices);
+        if (start < end)
+        {
+            threads.emplace_back(worker, start, end);
         }
     }
+
+    // Wait for all threads to complete
+    for (auto& thread : threads)
+    {
+        thread.join();
+    }
+
+    DBG("  2. Calculate Correlation Matrix: " << juce::String(juce::Time::getMillisecondCounterHiRes() - timer, 2) << " ms");
 
     return similarityMatrix;
 }

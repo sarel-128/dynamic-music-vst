@@ -296,16 +296,17 @@ void DynamicMusicVstAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
 
         // --- Real Analysis ---
         auto stepStartTime = juce::Time::getMillisecondCounterHiRes();
-        const int onsetHopSize = 512; // Use a consistent hop size for onset/beat analysis
-        onsetEnvelope = audioAnalyser.getOnsetStrengthEnvelope(analysisBuffer, fileSampleRate, onsetHopSize);
+        const int hopSize = 512; 
+        const int fftSize = 2048;
+        onsetEnvelope = audioAnalyser.getOnsetStrengthEnvelope(analysisBuffer, fileSampleRate, hopSize, fftSize);
         DBG("1. Onset Strength Envelope: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
 
         stepStartTime = juce::Time::getMillisecondCounterHiRes();
-        auto onsets = audioAnalyser.detectOnsets(onsetEnvelope, onsetHopSize);
+        auto onsets = audioAnalyser.detectOnsets(onsetEnvelope, hopSize);
         DBG("2. Detect Onsets: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
 
         stepStartTime = juce::Time::getMillisecondCounterHiRes();
-        estimatedBPM = audioAnalyser.estimateTempo(onsetEnvelope, fileSampleRate, onsetHopSize);
+        estimatedBPM = audioAnalyser.estimateTempo(onsetEnvelope, fileSampleRate, hopSize);
         tempogram = audioAnalyser.getLastTempogram();
         globalAcf = audioAnalyser.getLastGlobalAcf(); // Store aggregated profile for the UI
         DBG("3. Estimate Tempo: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
@@ -314,19 +315,18 @@ void DynamicMusicVstAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         
         // Beat timestamps are relative to the start of the analysisBuffer
         stepStartTime = juce::Time::getMillisecondCounterHiRes();
-        auto relativeBeatTimestamps = audioAnalyser.findBeats(onsetEnvelope, estimatedBPM, fileSampleRate, onsetHopSize, tightnessValue);
+        auto relativeBeatTimestamps = audioAnalyser.findBeats(onsetEnvelope, estimatedBPM, fileSampleRate, hopSize, tightnessValue);
         DBG("4. Find Beats: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
         
         // --- Calculate MFCCs and Similarity Matrix ---
         if (!relativeBeatTimestamps.empty())
         {
-            const int mfccHopSize = 256;
             stepStartTime = juce::Time::getMillisecondCounterHiRes();
-            auto allMfccs = audioAnalyser.calculateMFCCs(analysisBuffer, fileSampleRate);
+            auto allMfccs = audioAnalyser.calculateMFCCs(analysisBuffer, fileSampleRate, 40, fftSize, hopSize);
             DBG("5. Calculate MFCCs: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
 
             stepStartTime = juce::Time::getMillisecondCounterHiRes();
-            auto concatenatedMfccs = audioAnalyser.concatenateMFCCsByBeats(allMfccs, relativeBeatTimestamps, fileSampleRate, mfccHopSize);
+            auto concatenatedMfccs = audioAnalyser.concatenateMFCCsByBeats(allMfccs, relativeBeatTimestamps, fileSampleRate, hopSize);
             DBG("6. Concatenate MFCCs by Beats: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
 
             stepStartTime = juce::Time::getMillisecondCounterHiRes();
