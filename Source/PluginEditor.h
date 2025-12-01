@@ -27,13 +27,47 @@ public:
         
         g.setColour(juce::Colours::orange);
 
-        if (audioProcessor.getTotalLengthSecs() > 0)
+        int waveformVisibleWidth = getWidth();
+
+        if (audioProcessor.isRetargeted.load())
+        {
+            auto& buffer = audioProcessor.retargetedAudioBuffer;
+            auto originalLengthSecs = audioProcessor.getOriginalTotalLengthSecs();
+
+            if (buffer.getNumSamples() > 0 && originalLengthSecs > 0)
+            {
+                auto retargetedLengthSecs = buffer.getNumSamples() / audioProcessor.getSampleRate();
+                auto proportion = juce::jlimit(0.0, 1.0, retargetedLengthSecs / originalLengthSecs);
+                waveformVisibleWidth = (int)(getWidth() * proportion);
+
+                juce::Path path;
+                
+                const auto numSamples = buffer.getNumSamples();
+                const auto* channelData = buffer.getReadPointer(0); // Draw mono for simplicity
+
+                const float xScale = (float)waveformVisibleWidth / numSamples;
+                const float yScale = getHeight() * 0.5f;
+
+                path.startNewSubPath(0, yScale);
+
+                for (int i = 0; i < numSamples; ++i)
+                {
+                    path.lineTo(i * xScale, yScale - channelData[i] * yScale);
+                }
+                
+                g.strokePath(path, juce::PathStrokeType(1.0f));
+            }
+        }
+        else if (audioProcessor.getTotalLengthSecs() > 0)
         {
             audioProcessor.getAudioThumbnail().drawChannels(g, getLocalBounds(), 0.0, audioProcessor.getTotalLengthSecs(), 1.0f);
-
+        }
+        
+        if (audioProcessor.getTotalLengthSecs() > 0)
+        {
             auto playheadPos = (float)audioProcessor.getCurrentPositionSecs() / (float)audioProcessor.getTotalLengthSecs();
             g.setColour(juce::Colours::whitesmoke);
-            g.drawVerticalLine(juce::roundToInt(playheadPos * getWidth()), 0.0f, (float)getHeight());
+            g.drawVerticalLine(juce::roundToInt(playheadPos * waveformVisibleWidth), 0.0f, (float)getHeight());
         }
     }
     
@@ -303,7 +337,9 @@ public:
             {
                 juce::String labelText = "Time: " + juce::String(timeInSeconds, 2) + "s, BPM: " + juce::String(bpm, 1);
                 
-                float textWidth = g.getCurrentFont().getStringWidth(labelText);
+                juce::GlyphArrangement glyphs;
+                glyphs.addJustifiedText(g.getCurrentFont(), labelText, 0, 0, (float)getWidth(), juce::Justification::left);
+                float textWidth = glyphs.getBoundingBox(0, glyphs.getNumGlyphs(), true).getWidth();
                 
                 auto x = mousePosition.x + 12;
                 auto y = mousePosition.y;
@@ -363,6 +399,7 @@ private:
 //==============================================================================
 class DynamicMusicVstAudioProcessorEditor  : public juce::AudioProcessorEditor,
                                            public juce::Timer,
+                                           private juce::ChangeListener,
                                            private juce::AudioProcessorValueTreeState::Listener
 {
 public:
@@ -376,14 +413,16 @@ public:
 
 private:
     void parameterChanged (const juce::String& parameterID, float newValue) override;
+    void changeListenerCallback (juce::ChangeBroadcaster* source) override;
 
     DynamicMusicVstAudioProcessor& audioProcessor;
     juce::AudioProcessorValueTreeState& valueTreeState;
     
     WaveformDisplay waveformDisplay;
     SimilarityMatrixComponent similarityMatrixDisplay;
-    OnsetEnvelopeDisplay onsetEnvelopeDisplay;
-    TempogramDisplayComponent tempogramDisplay;
+    
+    //OnsetEnvelopeDisplay onsetEnvelopeDisplay;
+    //TempogramDisplayComponent tempogramDisplay;
     juce::Slider targetDurationSlider;
     juce::Slider beatTightnessSlider;
     juce::Slider trimStartSlider;
@@ -392,6 +431,7 @@ private:
     juce::TextButton openFileButton;
     juce::TextButton playButton;
     juce::TextButton stopButton;
+    juce::TextButton retargetButton;
     juce::Label statusLabel;
     juce::Label tempoLabel;
     juce::Label targetDurationLabel;

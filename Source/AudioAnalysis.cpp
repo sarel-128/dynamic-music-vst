@@ -780,6 +780,39 @@ std::vector<double> AudioAnalysis::findBeats(const std::vector<float>& onsetEnve
         beatTimes.push_back(static_cast<double>(frame) / sampleRate);
     }
 
+    // --- Extrapolate Beats ---
+    if (beatTimes.size() >= 2)
+    {
+        // Calculate median Inter-Beat Interval (IBI)
+        std::vector<double> ibis;
+        for (size_t i = 0; i < beatTimes.size() - 1; ++i)
+        {
+            ibis.push_back(beatTimes[i+1] - beatTimes[i]);
+        }
+        std::sort(ibis.begin(), ibis.end());
+        double medianIBI = ibis[ibis.size() / 2];
+
+        if (medianIBI > 0)
+        {
+            // Extrapolate backwards to start
+            while (beatTimes.front() > medianIBI * 1.1) // Allow 10% tolerance
+            {
+                double newBeat = beatTimes.front() - medianIBI;
+                if (newBeat < 0) break;
+                beatTimes.insert(beatTimes.begin(), newBeat);
+            }
+
+            // Extrapolate forwards to end
+            double totalDuration = (double)onsetEnvelope.size() * hopSize / sampleRate;
+            while (beatTimes.back() + medianIBI * 1.1 < totalDuration)
+            {
+                double newBeat = beatTimes.back() + medianIBI;
+                if (newBeat > totalDuration) break;
+                beatTimes.push_back(newBeat);
+            }
+        }
+    }
+
     return beatTimes;
 }
 
@@ -893,12 +926,12 @@ std::vector<std::vector<float>> AudioAnalysis::calculateMFCCs(const juce::AudioB
     return allMfccs;
 }
 
-std::vector<std::vector<float>> AudioAnalysis::concatenateMFCCsByBeats(const std::vector<std::vector<float>>& allMfccs, const std::vector<double>& beats, double sampleRate, int hopSize)
+std::vector<std::vector<float>> AudioAnalysis::calculateBeatMFCCs(const std::vector<std::vector<float>>& allMfccs, const std::vector<double>& beats, double sampleRate, int hopSize)
 {
-    std::vector<std::vector<float>> concatenatedMfccs;
+    std::vector<std::vector<float>> beatMfccs;
     if (beats.size() < 2 || allMfccs.empty())
     {
-        return concatenatedMfccs;
+        return beatMfccs;
     }
 
     auto timeToFrame = [&](double time) {
@@ -911,46 +944,49 @@ std::vector<std::vector<float>> AudioAnalysis::concatenateMFCCsByBeats(const std
         beatFrames.push_back(timeToFrame(beatTime));
     }
 
-    int min_dist = -1;
-    for (size_t i = 1; i < beatFrames.size(); ++i)
-    {
-        int dist = beatFrames[i] - beatFrames[i-1];
-        if (min_dist == -1 || dist < min_dist)
-        {
-            min_dist = dist;
-        }
-    }
-
-    if (min_dist <= 0)
-    {
-        // Cannot proceed with non-positive min_dist
-        return concatenatedMfccs;
-    }
+    int numCoefficients = allMfccs[0].size();
 
     for (size_t i = 0; i < beats.size() - 1; ++i)
     {
         int startFrame = beatFrames[i];
-        int endFrame = startFrame + min_dist;
+        int endFrame = beatFrames[i+1];
 
-        if (endFrame > (int)allMfccs.size())
+        // Ensure bounds
+        startFrame = std::max(0, startFrame);
+        endFrame = std::min((int)allMfccs.size(), endFrame);
+
+        if (startFrame >= endFrame)
         {
-            // Not enough frames for a full slice, skip this beat to avoid errors
+            // Empty beat or out of bounds, push zero vector or skip?
+            // Better to push a zero vector to keep index alignment with beats
+            beatMfccs.push_back(std::vector<float>(numCoefficients, 0.0f));
             continue;
         }
 
-        std::vector<float> one_mfcc;
-        // Reserve space for efficiency
-        one_mfcc.reserve(allMfccs[0].size() * min_dist);
+        std::vector<float> meanMfcc(numCoefficients, 0.0f);
+        int count = 0;
 
         for (int frame = startFrame; frame < endFrame; ++frame)
         {
-            one_mfcc.insert(one_mfcc.end(), allMfccs[frame].begin(), allMfccs[frame].end());
+            for (int k = 0; k < numCoefficients; ++k)
+            {
+                meanMfcc[k] += allMfccs[frame][k];
+            }
+            count++;
         }
         
-        concatenatedMfccs.push_back(one_mfcc);
+        if (count > 0)
+        {
+            for (float& val : meanMfcc)
+            {
+                val /= count;
+            }
+        }
+        
+        beatMfccs.push_back(meanMfcc);
     }
 
-    return concatenatedMfccs;
+    return beatMfccs;
 }
 
 // Helper to calculate Pearson correlation, assuming inputs are already ranked for Spearman

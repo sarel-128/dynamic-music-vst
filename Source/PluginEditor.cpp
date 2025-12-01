@@ -5,6 +5,7 @@ DynamicMusicVstAudioProcessorEditor::DynamicMusicVstAudioProcessorEditor (Dynami
     : AudioProcessorEditor (&p), audioProcessor (p), valueTreeState(vts), waveformDisplay(p)
 {
     setSize (900, 900);
+    audioProcessor.addChangeListener(this);
 
     // Waveform Display
     addAndMakeVisible(waveformDisplay);
@@ -13,10 +14,10 @@ DynamicMusicVstAudioProcessorEditor::DynamicMusicVstAudioProcessorEditor (Dynami
     addAndMakeVisible(similarityMatrixDisplay);
 
     // Onset Envelope Display
-    addAndMakeVisible(onsetEnvelopeDisplay);
+    //addAndMakeVisible(onsetEnvelopeDisplay);
 
     // Tempogram Display
-    addAndMakeVisible(tempogramDisplay);
+    //addAndMakeVisible(tempogramDisplay);
 
     // Show Similarity Matrix Toggle
     showSimilarityMatrixButton.setButtonText("Show Similarity Matrix");
@@ -25,6 +26,12 @@ DynamicMusicVstAudioProcessorEditor::DynamicMusicVstAudioProcessorEditor (Dynami
     valueTreeState.addParameterListener("showSimilarityMatrix", this);
     // Initial visibility for startup
     similarityMatrixDisplay.setVisible(valueTreeState.getRawParameterValue("showSimilarityMatrix")->load());
+    
+    // Handle constraints from UI
+    similarityMatrixDisplay.onConstraintsChanged = [this](const std::vector<std::pair<float, float>>& constraints)
+    {
+        audioProcessor.userConstraints = constraints;
+    };
 
     // Target Duration Slider
     targetDurationAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(valueTreeState, "targetDuration", targetDurationSlider);
@@ -87,6 +94,13 @@ DynamicMusicVstAudioProcessorEditor::DynamicMusicVstAudioProcessorEditor (Dynami
     };
     addAndMakeVisible(analyzeButton);
 
+    // Retarget Button
+    retargetButton.setButtonText("Retarget");
+    retargetButton.onClick = [this] {
+        audioProcessor.retargetState = DynamicMusicVstAudioProcessor::RetargetState::RetargetingNeeded;
+    };
+    addAndMakeVisible(retargetButton);
+
     // Status Label
     statusLabel.setText("Ready", juce::dontSendNotification);
     statusLabel.setJustificationType(juce::Justification::centred);
@@ -103,6 +117,7 @@ DynamicMusicVstAudioProcessorEditor::DynamicMusicVstAudioProcessorEditor (Dynami
 DynamicMusicVstAudioProcessorEditor::~DynamicMusicVstAudioProcessorEditor()
 {
     valueTreeState.removeParameterListener("showSimilarityMatrix", this);
+    audioProcessor.removeChangeListener(this);
     stopTimer();
 }
 
@@ -140,8 +155,9 @@ void DynamicMusicVstAudioProcessorEditor::timerCallback()
 
     auto playheadRatio = audioProcessor.getTotalLengthSecs() > 0 ? (float)audioProcessor.getCurrentPositionSecs() / (float)audioProcessor.getTotalLengthSecs() : 0.0f;
     similarityMatrixDisplay.setPlayheadPosition(playheadRatio);
-    onsetEnvelopeDisplay.setPlayheadPosition(playheadRatio);
-    tempogramDisplay.setPlayheadPosition(playheadRatio);
+    similarityMatrixDisplay.setTargetDuration(targetDurationSlider.getValue());
+    //onsetEnvelopeDisplay.setPlayheadPosition(playheadRatio);
+    //tempogramDisplay.setPlayheadPosition(playheadRatio);
 
     if (audioProcessor.getTotalLengthSecs() > 0)
     {
@@ -174,10 +190,30 @@ void DynamicMusicVstAudioProcessorEditor::timerCallback()
             tempoLabel.setText("BPM: " + juce::String(audioProcessor.estimatedBPM, 1), juce::dontSendNotification);
             similarityMatrixDisplay.updateBeatInfo(audioProcessor.beatTimestamps, audioProcessor.getTotalLengthSecs());
             similarityMatrixDisplay.updateMatrix(audioProcessor.similarityMatrix);
-            onsetEnvelopeDisplay.updateOnsetEnvelope(audioProcessor.onsetEnvelope);
-            onsetEnvelopeDisplay.updateBeatInfo(audioProcessor.beatTimestamps, audioProcessor.getTotalLengthSecs());
-            tempogramDisplay.updateDisplayInfo(audioProcessor.tempogram, audioProcessor.globalAcf, audioProcessor.getSampleRate(), 512);
+            //onsetEnvelopeDisplay.updateOnsetEnvelope(audioProcessor.onsetEnvelope);
+            //onsetEnvelopeDisplay.updateBeatInfo(audioProcessor.beatTimestamps, audioProcessor.getTotalLengthSecs());
+            //tempogramDisplay.updateDisplayInfo(audioProcessor.tempogram, audioProcessor.globalAcf, audioProcessor.getSampleRate(), 512);
             audioProcessor.analysisState = DynamicMusicVstAudioProcessor::AnalysisState::Ready; // Reset state
+            break;
+    }
+
+    switch (audioProcessor.retargetState.load())
+    {
+        case DynamicMusicVstAudioProcessor::RetargetState::Ready:
+            retargetButton.setEnabled(true);
+            break;
+        case DynamicMusicVstAudioProcessor::RetargetState::RetargetingNeeded:
+            statusLabel.setText("Retargeting required", juce::dontSendNotification);
+            retargetButton.setEnabled(true);
+            break;
+        case DynamicMusicVstAudioProcessor::RetargetState::Retargeting:
+            statusLabel.setText("Retargeting...", juce::dontSendNotification);
+            retargetButton.setEnabled(false);
+            break;
+        case DynamicMusicVstAudioProcessor::RetargetState::RetargetingComplete:
+            statusLabel.setText("Retargeting Complete!", juce::dontSendNotification);
+            similarityMatrixDisplay.updatePath(audioProcessor.retargetedBeatPath);
+            audioProcessor.retargetState = DynamicMusicVstAudioProcessor::RetargetState::Ready; // Reset state
             break;
     }
 }
@@ -187,6 +223,16 @@ void DynamicMusicVstAudioProcessorEditor::parameterChanged(const juce::String &p
     if (parameterID == "showSimilarityMatrix")
     {
         similarityMatrixDisplay.setVisible(newValue > 0.5f);
+    }
+}
+
+void DynamicMusicVstAudioProcessorEditor::changeListenerCallback(juce::ChangeBroadcaster *source)
+{
+    if (source == &audioProcessor)
+    {
+        // This is called when createRetargetedAudio finishes
+        similarityMatrixDisplay.setRetargetedMode(audioProcessor.isRetargeted.load());
+        waveformDisplay.repaint();
     }
 }
 
@@ -206,8 +252,8 @@ void DynamicMusicVstAudioProcessorEditor::resized()
     juce::FlexBox plotsBox;
     plotsBox.flexDirection = juce::FlexBox::Direction::column;
     plotsBox.items.add(juce::FlexItem(similarityMatrixDisplay).withHeight(plotsBounds.getWidth()));
-    plotsBox.items.add(juce::FlexItem(onsetEnvelopeDisplay).withHeight(120).withMargin(juce::FlexItem::Margin(5, 0, 0, 0)));
-    plotsBox.items.add(juce::FlexItem(tempogramDisplay).withHeight(120).withMargin(juce::FlexItem::Margin(5, 0, 0, 0)));
+    //plotsBox.items.add(juce::FlexItem(onsetEnvelopeDisplay).withHeight(120).withMargin(juce::FlexItem::Margin(5, 0, 0, 0)));
+    //plotsBox.items.add(juce::FlexItem(tempogramDisplay).withHeight(120).withMargin(juce::FlexItem::Margin(5, 0, 0, 0)));
     plotsBox.items.add(juce::FlexItem(waveformDisplay).withHeight(80).withMargin(juce::FlexItem::Margin(5, 0, 0, 0)));
     plotsBox.performLayout(plotsBounds);
 
@@ -224,6 +270,7 @@ void DynamicMusicVstAudioProcessorEditor::resized()
     buttonBox.items.add(juce::FlexItem(playButton).withFlex(3.0f).withHeight(30));
     buttonBox.items.add(juce::FlexItem(stopButton).withFlex(3.0f).withHeight(30));
     buttonBox.items.add(juce::FlexItem(analyzeButton).withFlex(4.0f).withHeight(30));
+    buttonBox.items.add(juce::FlexItem(retargetButton).withFlex(4.0f).withHeight(30));
     controlsBox.items.add(juce::FlexItem(buttonBox).withHeight(50));
 
     // Toggle

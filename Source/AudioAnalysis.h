@@ -45,7 +45,7 @@ public:
                                                    int numCoefficients = 40,
                                                    int fftSize = 2048,
                                                    int hopSize = 512);
-    std::vector<std::vector<float>> concatenateMFCCsByBeats(const std::vector<std::vector<float>>& allMfccs, const std::vector<double>& beats, double sampleRate, int hopSize);
+    std::vector<std::vector<float>> calculateBeatMFCCs(const std::vector<std::vector<float>>& allMfccs, const std::vector<double>& beats, double sampleRate, int hopSize);
     std::vector<std::vector<float>> createSimilarityMatrix(const std::vector<std::vector<float>>& mfccs);
     float calculateSpearmanCorrelation(const std::vector<float>& x, const std::vector<float>& y);
     std::vector<std::vector<float>> smoothSimilarityMatrix(const std::vector<std::vector<float>>& matrix, int windowSize);

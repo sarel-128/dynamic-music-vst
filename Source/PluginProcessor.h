@@ -5,9 +5,11 @@
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_audio_utils/juce_audio_utils.h>
 #include "AudioAnalysis.h"
+#include "AudioRetarget.h"
 
 class DynamicMusicVstAudioProcessor  : public juce::AudioProcessor,
-                                       public juce::ChangeListener
+                                       public juce::ChangeListener,
+                                       public juce::ChangeBroadcaster
 {
 public:
     DynamicMusicVstAudioProcessor();
@@ -55,6 +57,7 @@ public:
     bool isPlaying() const;
     double getCurrentPositionSecs() const;
     double getTotalLengthSecs() const;
+    double getOriginalTotalLengthSecs() const;
 
     enum class AnalysisState
     {
@@ -64,6 +67,16 @@ public:
         AnalysisComplete
     };
     std::atomic<AnalysisState> analysisState { AnalysisState::Ready };
+    
+    enum class RetargetState
+    {
+        Ready,
+        RetargetingNeeded,
+        Retargeting,
+        RetargetingComplete
+    };
+    std::atomic<RetargetState> retargetState { RetargetState::Ready };
+
     float estimatedBPM { 120.0f };
     std::vector<double> beatTimestamps;
     std::vector<std::vector<float>> mfccs;
@@ -71,9 +84,15 @@ public:
     std::vector<std::vector<float>> tempogram;
     std::vector<float> globalAcf;
     std::vector<float> onsetEnvelope;
+    std::vector<int> retargetedBeatPath;
+    juce::AudioBuffer<float> retargetedAudioBuffer;
+    std::atomic<bool> isRetargeted { false };
+    std::vector<std::pair<float, float>> userConstraints;
 
 private:
+    void createRetargetedAudio(const std::vector<int>& path);
     double fileSampleRate = 44100.0; // Default, will be updated on file load
+    float crossfadeMs { 20.0f };
     
     // --- Metronome Click Synthesis ---
     double clickFrequency { 1000.0 };
@@ -87,6 +106,7 @@ private:
     juce::AudioProcessorValueTreeState parameters;
     
     AudioAnalysis audioAnalyser;
+    AudioRetargeter audioRetargeter;
     juce::AudioThumbnailCache thumbnailCache { 5 };
     juce::AudioThumbnail audioThumbnail;
 
@@ -94,8 +114,16 @@ private:
     juce::AudioFormatManager formatManager;
     std::unique_ptr<juce::AudioFormatReaderSource> fileReaderSource;
     juce::AudioTransportSource fileTransportSource;
+    std::unique_ptr<juce::MemoryAudioSource> retargetedMemorySource;
+    juce::AudioTransportSource retargetedTransportSource;
     bool isPlayingFile {false};
     juce::CriticalSection transportSourceLock;
+
+    // --- Retargeted Playback State ---
+    std::atomic<double> currentPlaybackPositionSecs { 0.0 };
+    int currentRetargetBeatIndex = 0;
+    int samplesIntoCurrentBeat = 0;
+
 
     // This will hold our "remix map"
     // For now, it's a simple vector of sample ranges from the source buffer

@@ -25,6 +25,8 @@ target_sources(DynamicMusicVst PRIVATE
     Source/PluginEditor.h
     Source/AudioAnalysis.cpp
     Source/AudioAnalysis.h
+    Source/AudioRetarget.cpp
+    Source/AudioRetarget.h
     Source/SimilarityMatrixComponent.cpp
     Source/SimilarityMatrixComponent.h)
 
