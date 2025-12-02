@@ -149,8 +149,8 @@ void SimilarityMatrixComponent::paint(juce::Graphics& g)
             {
                 // Regular constraint: green
                 g.setColour(juce::Colours::green);
-                g.fillEllipse(x - 4.0f, y - 4.0f, 8.0f, 8.0f);
-                g.drawEllipse(x - 6.0f, y - 6.0f, 12.0f, 12.0f, 2.0f);
+            g.fillEllipse(x - 4.0f, y - 4.0f, 8.0f, 8.0f);
+            g.drawEllipse(x - 6.0f, y - 6.0f, 12.0f, 12.0f, 2.0f);
             }
         }
     }
@@ -169,7 +169,7 @@ void SimilarityMatrixComponent::mouseDown(const juce::MouseEvent& event)
 
     // Check if clicking near an existing constraint
     int hitId = findConstraintAtPosition(event.getPosition());
-    
+
     // Check if hit constraint is a special anchor
     bool hitStartAnchor = false;
     bool hitEndAnchor = false;
@@ -204,7 +204,7 @@ void SimilarityMatrixComponent::mouseDown(const juce::MouseEvent& event)
             {
                 selectedConstraintId = -1;
                 isDragging = false;
-            }
+    }
             else
             {
                 // End anchor or regular constraint - can be dragged

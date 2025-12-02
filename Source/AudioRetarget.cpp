@@ -159,9 +159,15 @@ AudioRetargeter::RetargetResult AudioRetargeter::retargetDuration(const std::vec
                     float dist = 1.0f - similarityMatrix[k + 1][j];
                     float transitionCost = similarityPenalty * dist;
 
-                    if (j < k)
+                    if (j < k) // Backward jump
                     {
-                        transitionCost += backwardJumpPenalty;
+                        int jumpDistance = k - j;
+                        // Penalty decreases as jump distance increases (prefer longer loops)
+                        // User example: distance 20 -> cost 0.2. This implies Cost = 4.0 / Distance.
+                        // We'll use backwardJumpPenalty as a base scaler.
+                        // If backwardJumpPenalty is ~0.7-1.0, multiplying by 5.0 gives ~3.5-5.0 range.
+                        transitionCost += (backwardJumpPenalty * 5.0f) / (float)jumpDistance;
+                    
                     }
 
                     float currentCost = cost[i - 1][k] + transitionCost + timeDeviationCost + constraintCost;
@@ -354,9 +360,21 @@ AudioRetargeter::RetargetResult AudioRetargeter::retargetSegment(
                     float dist = 1.0f - similarityMatrix[k + 1][j];
                     float transitionCost = similarityPenalty * dist;
 
-                    if (j < k)
+                    if (j < k) // Backward jump
                     {
-                        transitionCost += backwardJumpPenalty;
+                        int jumpDistance = k - j;
+                        if (jumpDistance < 4) // Prevent very short loops (stuttering)
+                        {
+                             transitionCost = std::numeric_limits<float>::infinity();
+                        }
+                        else
+                        {
+                            // Penalty decreases as jump distance increases (prefer longer loops)
+                            // User example: distance 20 -> cost 0.2. This implies Cost = 4.0 / Distance.
+                            // We'll use backwardJumpPenalty as a base scaler.
+                            // If backwardJumpPenalty is ~0.7-1.0, multiplying by 5.0 gives ~3.5-5.0 range.
+                            transitionCost += (backwardJumpPenalty * 5.0f) / (float)jumpDistance;
+                        }
                     }
 
                     float currentCost = cost[i - 1][k] + transitionCost + timeDeviationCost + constraintCost;
