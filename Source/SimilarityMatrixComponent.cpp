@@ -1,4 +1,5 @@
 #include "SimilarityMatrixComponent.h"
+#include "PluginProcessor.h"  // For ConstraintPoint struct
 
 SimilarityMatrixComponent::SimilarityMatrixComponent()
 {
@@ -103,16 +104,54 @@ void SimilarityMatrixComponent::paint(juce::Graphics& g)
     // Draw user constraints
     if (!constraints.empty() && duration > 0)
     {
-        g.setColour(juce::Colours::green);
         for (const auto& c : constraints)
         {
-            // c.first is Source Time (Y), c.second is Target Time (X)
-            // Both axes mapped to Source Duration based on user request
-            float x = (c.second / duration) * getWidth();
-            float y = (c.first / duration) * getHeight();
+            // c.sourceTime is Y-axis, c.targetTime is X-axis
+            float x = (c.targetTime / duration) * getWidth();
+            float y = (c.sourceTime / duration) * getHeight();
             
-            g.fillEllipse(x - 4.0f, y - 4.0f, 8.0f, 8.0f);
-            g.drawEllipse(x - 6.0f, y - 6.0f, 12.0f, 12.0f, 2.0f);
+            // Highlight selected constraint
+            if (c.id == selectedConstraintId)
+            {
+                g.setColour(juce::Colours::yellow);
+                g.fillEllipse(x - 6.0f, y - 6.0f, 12.0f, 12.0f);
+                g.setColour(juce::Colours::orange);
+                g.drawEllipse(x - 8.0f, y - 8.0f, 16.0f, 16.0f, 3.0f);
+                
+                // Draw horizontal line for end anchor to indicate X-only movement
+                if (c.isEndAnchor)
+                {
+                    g.setColour(juce::Colours::orange.withAlpha(0.5f));
+                    g.drawHorizontalLine(static_cast<int>(y), 0.0f, static_cast<float>(getWidth()));
+                }
+            }
+            else if (c.isStartAnchor)
+            {
+                // Start anchor: fixed, shown in red/pink
+                g.setColour(juce::Colours::hotpink);
+                g.fillEllipse(x - 5.0f, y - 5.0f, 10.0f, 10.0f);
+                g.setColour(juce::Colours::red);
+                g.drawEllipse(x - 7.0f, y - 7.0f, 14.0f, 14.0f, 2.0f);
+            }
+            else if (c.isEndAnchor)
+            {
+                // End anchor: X-axis movable, shown in blue/cyan
+                g.setColour(juce::Colours::cyan);
+                g.fillEllipse(x - 5.0f, y - 5.0f, 10.0f, 10.0f);
+                g.setColour(juce::Colours::blue);
+                g.drawEllipse(x - 7.0f, y - 7.0f, 14.0f, 14.0f, 2.0f);
+                
+                // Draw subtle horizontal line to indicate X-only movement
+                g.setColour(juce::Colours::blue.withAlpha(0.3f));
+                g.drawHorizontalLine(static_cast<int>(y), 0.0f, static_cast<float>(getWidth()));
+            }
+            else
+            {
+                // Regular constraint: green
+                g.setColour(juce::Colours::green);
+                g.fillEllipse(x - 4.0f, y - 4.0f, 8.0f, 8.0f);
+                g.drawEllipse(x - 6.0f, y - 6.0f, 12.0f, 12.0f, 2.0f);
+            }
         }
     }
 }
@@ -128,28 +167,180 @@ void SimilarityMatrixComponent::mouseDown(const juce::MouseEvent& event)
 {
     if (duration <= 0.0) return;
 
-    float xProp = (float)event.x / (float)getWidth();
-    float yProp = (float)event.y / (float)getHeight();
-
-    // Map: X -> Target Time, Y -> Source Time
-    // Both mapped relative to Source Duration (matrix axes)
-    float clickedTargetTime = xProp * duration;
-    float clickedSourceTime = yProp * duration;
-
-    // Right click clears constraints
+    // Check if clicking near an existing constraint
+    int hitId = findConstraintAtPosition(event.getPosition());
+    
+    // Check if hit constraint is a special anchor
+    bool hitStartAnchor = false;
+    bool hitEndAnchor = false;
+    for (const auto& c : constraints)
+    {
+        if (c.id == hitId)
+        {
+            hitStartAnchor = c.isStartAnchor;
+            hitEndAnchor = c.isEndAnchor;
+            break;
+        }
+    }
+    
     if (event.mods.isRightButtonDown())
     {
-        constraints.clear();
+        // Right-click: remove constraint if one is hit (but not start/end anchors)
+        if (hitId >= 0 && !hitStartAnchor && !hitEndAnchor)
+        {
+            if (onConstraintRemoved)
+                onConstraintRemoved(hitId);
+        }
+        selectedConstraintId = -1;
+        isDragging = false;
     }
     else
     {
-        constraints.push_back({clickedSourceTime, clickedTargetTime});
+        // Left-click
+        if (hitId >= 0)
+        {
+            // Start anchor cannot be moved at all
+            if (hitStartAnchor)
+            {
+                selectedConstraintId = -1;
+                isDragging = false;
+            }
+            else
+            {
+                // End anchor or regular constraint - can be dragged
+                selectedConstraintId = hitId;
+                isDragging = true;
+                dragStartPosition = event.getPosition();
+            }
+        }
+        else
+        {
+            // Clicking empty area - will add on mouseUp if not dragged
+            selectedConstraintId = -1;
+            isDragging = false;
+            dragStartPosition = event.getPosition();
+        }
     }
-
-    if (onConstraintsChanged)
-        onConstraintsChanged(constraints);
     
     repaint();
+}
+
+void SimilarityMatrixComponent::mouseDrag(const juce::MouseEvent& event)
+{
+    if (duration <= 0.0) return;
+    
+    if (isDragging && selectedConstraintId >= 0)
+    {
+        // Update visual position during drag (for live feedback)
+        float xProp = juce::jlimit(0.0f, 1.0f, (float)event.x / (float)getWidth());
+        float yProp = juce::jlimit(0.0f, 1.0f, (float)event.y / (float)getHeight());
+        
+        float newTargetTime = xProp * duration;
+        float newSourceTime = yProp * duration;
+        
+        // Update local display constraint for live feedback
+        for (auto& c : constraints)
+        {
+            if (c.id == selectedConstraintId)
+            {
+                // End anchor: only X-axis movement (targetTime changes, sourceTime stays fixed)
+                if (c.isEndAnchor)
+                {
+                    c.targetTime = newTargetTime;
+                    // sourceTime remains at the end of the original audio
+                }
+                else
+                {
+                    // Regular constraint: free movement on both axes
+                    c.sourceTime = newSourceTime;
+                    c.targetTime = newTargetTime;
+                }
+                break;
+            }
+        }
+        
+        repaint();
+    }
+}
+
+void SimilarityMatrixComponent::mouseUp(const juce::MouseEvent& event)
+{
+    if (duration <= 0.0) return;
+    
+    float xProp = juce::jlimit(0.0f, 1.0f, (float)event.x / (float)getWidth());
+    float yProp = juce::jlimit(0.0f, 1.0f, (float)event.y / (float)getHeight());
+    
+    float targetTime = xProp * duration;
+    float sourceTime = yProp * duration;
+    
+    if (isDragging && selectedConstraintId >= 0)
+    {
+        // Check if this is the end anchor (X-axis only movement)
+        bool isEndAnchor = false;
+        float originalSourceTime = 0.0f;
+        for (const auto& c : constraints)
+        {
+            if (c.id == selectedConstraintId)
+            {
+                isEndAnchor = c.isEndAnchor;
+                if (isEndAnchor)
+                {
+                    // For end anchor, preserve the original sourceTime (end of original audio)
+                    // Find the original value - it should be the max sourceTime among anchors
+                    originalSourceTime = c.sourceTime;  // This was not changed during drag
+                }
+                break;
+            }
+        }
+        
+        // Finalize move
+        if (onConstraintMoved)
+        {
+            if (isEndAnchor)
+            {
+                // End anchor: only pass new targetTime, sourceTime stays at original end
+                onConstraintMoved(selectedConstraintId, originalSourceTime, targetTime);
+            }
+            else
+            {
+                // Regular constraint: both axes can change
+                onConstraintMoved(selectedConstraintId, sourceTime, targetTime);
+            }
+        }
+    }
+    else if (!event.mods.isRightButtonDown())
+    {
+        // Check if this was a simple click (not a drag)
+        auto dragDistance = event.getPosition().getDistanceFrom(dragStartPosition);
+        if (dragDistance < 5.0f)
+        {
+            // Simple click - add new constraint
+            if (onConstraintAdded)
+                onConstraintAdded(sourceTime, targetTime);
+        }
+    }
+    
+    isDragging = false;
+    selectedConstraintId = -1;
+    repaint();
+}
+
+int SimilarityMatrixComponent::findConstraintAtPosition(juce::Point<int> pos, float hitRadius) const
+{
+    if (duration <= 0.0) return -1;
+    
+    for (const auto& c : constraints)
+    {
+        float x = (c.targetTime / duration) * getWidth();
+        float y = (c.sourceTime / duration) * getHeight();
+        
+        juce::Point<float> constraintPos(x, y);
+        if (constraintPos.getDistanceFrom(pos.toFloat()) <= hitRadius)
+        {
+            return c.id;
+        }
+    }
+    return -1;
 }
 
 void SimilarityMatrixComponent::mouseExit(const juce::MouseEvent& event)
@@ -203,8 +394,24 @@ void SimilarityMatrixComponent::setTargetDuration(double targetDur)
 void SimilarityMatrixComponent::clearConstraints()
 {
     constraints.clear();
-    if (onConstraintsChanged)
-        onConstraintsChanged(constraints);
+    selectedConstraintId = -1;
+    isDragging = false;
+    repaint();
+}
+
+void SimilarityMatrixComponent::updateConstraints(const std::vector<ConstraintPoint>& newConstraints)
+{
+    constraints.clear();
+    for (const auto& c : newConstraints)
+    {
+        DisplayConstraint dc;
+        dc.id = c.id;
+        dc.sourceTime = c.sourceTime;
+        dc.targetTime = c.targetTime;
+        dc.isStartAnchor = (c.id == 0);  // First constraint is start anchor
+        dc.isEndAnchor = (c.id == 1);    // Second constraint is end anchor
+        constraints.push_back(dc);
+    }
     repaint();
 }
 

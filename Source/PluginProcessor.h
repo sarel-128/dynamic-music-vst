@@ -7,6 +7,14 @@
 #include "AudioAnalysis.h"
 #include "AudioRetarget.h"
 
+// Shared constraint point structure for interactive retargeting
+struct ConstraintPoint
+{
+    int id;
+    float sourceTime;  // Y-axis - time in original audio
+    float targetTime;  // X-axis - time in retargeted audio
+};
+
 class DynamicMusicVstAudioProcessor  : public juce::AudioProcessor,
                                        public juce::ChangeListener,
                                        public juce::ChangeBroadcaster
@@ -87,10 +95,24 @@ public:
     std::vector<int> retargetedBeatPath;
     juce::AudioBuffer<float> retargetedAudioBuffer;
     std::atomic<bool> isRetargeted { false };
-    std::vector<std::pair<float, float>> userConstraints;
+    
+    // Constraint management - the processor owns all constraint state
+    std::vector<ConstraintPoint> userConstraints;
+    int nextConstraintId { 0 };
+    
+    // Constraint manipulation methods - called from UI
+    int addConstraint(float sourceTime, float targetTime);
+    void moveConstraint(int id, float newSourceTime, float newTargetTime);
+    void removeConstraint(int id);
+    void initializeDefaultConstraints();
+    void performFullRetarget();
+    
+    // Get sorted constraints for UI display
+    const std::vector<ConstraintPoint>& getConstraints() const { return userConstraints; }
 
 private:
     void createRetargetedAudio(const std::vector<int>& path);
+    void performSegmentedRetarget(int changedConstraintId);
     double fileSampleRate = 44100.0; // Default, will be updated on file load
     float crossfadeMs { 20.0f };
     

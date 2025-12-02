@@ -27,10 +27,29 @@ DynamicMusicVstAudioProcessorEditor::DynamicMusicVstAudioProcessorEditor (Dynami
     // Initial visibility for startup
     similarityMatrixDisplay.setVisible(valueTreeState.getRawParameterValue("showSimilarityMatrix")->load());
     
-    // Handle constraints from UI
-    similarityMatrixDisplay.onConstraintsChanged = [this](const std::vector<std::pair<float, float>>& constraints)
+    // Handle constraint events from UI
+    similarityMatrixDisplay.onConstraintAdded = [this](float sourceTime, float targetTime)
     {
-        audioProcessor.userConstraints = constraints;
+        audioProcessor.addConstraint(sourceTime, targetTime);
+        // Sync display back from processor
+        similarityMatrixDisplay.updateConstraints(audioProcessor.getConstraints());
+        similarityMatrixDisplay.updatePath(audioProcessor.retargetedBeatPath);
+    };
+    
+    similarityMatrixDisplay.onConstraintMoved = [this](int id, float newSourceTime, float newTargetTime)
+    {
+        audioProcessor.moveConstraint(id, newSourceTime, newTargetTime);
+        // Sync display back from processor
+        similarityMatrixDisplay.updateConstraints(audioProcessor.getConstraints());
+        similarityMatrixDisplay.updatePath(audioProcessor.retargetedBeatPath);
+    };
+    
+    similarityMatrixDisplay.onConstraintRemoved = [this](int id)
+    {
+        audioProcessor.removeConstraint(id);
+        // Sync display back from processor
+        similarityMatrixDisplay.updateConstraints(audioProcessor.getConstraints());
+        similarityMatrixDisplay.updatePath(audioProcessor.retargetedBeatPath);
     };
 
     // Target Duration Slider
@@ -190,6 +209,15 @@ void DynamicMusicVstAudioProcessorEditor::timerCallback()
             tempoLabel.setText("BPM: " + juce::String(audioProcessor.estimatedBPM, 1), juce::dontSendNotification);
             similarityMatrixDisplay.updateBeatInfo(audioProcessor.beatTimestamps, audioProcessor.getTotalLengthSecs());
             similarityMatrixDisplay.updateMatrix(audioProcessor.similarityMatrix);
+            
+            // Initialize default constraints after analysis
+            audioProcessor.initializeDefaultConstraints();
+            similarityMatrixDisplay.updateConstraints(audioProcessor.getConstraints());
+            
+            // Run initial full retarget
+            audioProcessor.performFullRetarget();
+            similarityMatrixDisplay.updatePath(audioProcessor.retargetedBeatPath);
+            
             //onsetEnvelopeDisplay.updateOnsetEnvelope(audioProcessor.onsetEnvelope);
             //onsetEnvelopeDisplay.updateBeatInfo(audioProcessor.beatTimestamps, audioProcessor.getTotalLengthSecs());
             //tempogramDisplay.updateDisplayInfo(audioProcessor.tempogram, audioProcessor.globalAcf, audioProcessor.getSampleRate(), 512);
@@ -213,6 +241,7 @@ void DynamicMusicVstAudioProcessorEditor::timerCallback()
         case DynamicMusicVstAudioProcessor::RetargetState::RetargetingComplete:
             statusLabel.setText("Retargeting Complete!", juce::dontSendNotification);
             similarityMatrixDisplay.updatePath(audioProcessor.retargetedBeatPath);
+            similarityMatrixDisplay.updateConstraints(audioProcessor.getConstraints());
             audioProcessor.retargetState = DynamicMusicVstAudioProcessor::RetargetState::Ready; // Reset state
             break;
     }
