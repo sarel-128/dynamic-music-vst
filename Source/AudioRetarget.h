@@ -16,6 +16,8 @@ public:
     {
         std::vector<int> path;
         float cost;
+        int actualStartBeat;  // The actual beat used at the start (within tolerance)
+        int actualEndBeat;    // The actual beat used at the end (within tolerance)
     };
 
     // Full retargeting - processes entire timeline
@@ -25,8 +27,6 @@ public:
                                       float similarityPenalty,
                                       float backwardJumpPenalty,
                                       float timeContinuityPenalty,
-                                      float constraintTimePenalty,
-                                      float constraintBeatPenalty,
                                       const std::vector<std::pair<float, float>>& timeConstraints);
 
     // Segmented retargeting - processes only a slice of the timeline between anchors
@@ -34,15 +34,14 @@ public:
                                     const std::vector<float>& beats,
                                     int startStep,           // Time boundary start (in steps)
                                     int endStep,             // Time boundary end (in steps)
-                                    int startBeat,           // Fixed anchor beat at startStep
-                                    int endBeat,             // Fixed anchor beat at endStep
+                                    int startBeat,           // Target anchor beat at startStep
+                                    int endBeat,             // Target anchor beat at endStep
                                     float secondsPerBeat,    // For time calculations
-                                    const std::vector<ConstraintPoint>& constraintsInSegment,
                                     float similarityPenalty,
                                     float backwardJumpPenalty,
                                     float timeContinuityPenalty,
-                                    float constraintTimePenalty,
-                                    float constraintBeatPenalty);
+                                    int startBeatTolerance = 5,  // Tolerance in beats for start anchor
+                                    int endBeatTolerance = 5);   // Tolerance in beats for end anchor
 
 private:
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(AudioRetargeter)

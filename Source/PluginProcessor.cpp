@@ -853,11 +853,41 @@ void DynamicMusicVstAudioProcessor::moveConstraint(int id, float newSourceTime, 
                   return a.targetTime < b.targetTime;
               });
     
-    // End anchor movement changes total duration, requiring full retarget
-    // (segmented retarget can't change path length)
+    // Special handling for End Anchor (id=1): it changes path length
     if (id == 1)
     {
-        performFullRetarget();
+        // Calculate new path length based on new target duration
+        float secondsPerBeat = 0.5f;
+        if (beatTimestamps.size() > 1)
+        {
+            secondsPerBeat = static_cast<float>((beatTimestamps.back() - beatTimestamps.front()) / 
+                                                (beatTimestamps.size() - 1));
+        }
+        
+        int newPathLength = static_cast<int>(newTargetTime / secondsPerBeat);
+        if (newPathLength <= 0) newPathLength = 1;
+        
+        int oldPathLength = static_cast<int>(retargetedBeatPath.size());
+        
+        if (newPathLength != oldPathLength)
+        {
+            DBG("Resizing path from " << oldPathLength << " to " << newPathLength << " steps");
+            
+            if (newPathLength > oldPathLength)
+            {
+                // Path is getting longer - extend with the last beat (will be overwritten by segmented retarget)
+                int lastBeat = retargetedBeatPath.empty() ? 0 : retargetedBeatPath.back();
+                retargetedBeatPath.resize(newPathLength, lastBeat);
+            }
+            else
+            {
+                // Path is getting shorter - truncate
+                retargetedBeatPath.resize(newPathLength);
+            }
+        }
+        
+        // Now use segmented retarget to update ONLY the last segment
+        performSegmentedRetarget(id);
     }
     else
     {
@@ -889,49 +919,74 @@ void DynamicMusicVstAudioProcessor::removeConstraint(int id)
 
 void DynamicMusicVstAudioProcessor::performFullRetarget()
 {
+    performRetarget(true, -1);
+}
+
+void DynamicMusicVstAudioProcessor::performSegmentedRetarget(int changedConstraintId)
+{
+    performRetarget(false, changedConstraintId);
+}
+
+void DynamicMusicVstAudioProcessor::performRetarget(bool isFullRetarget, int changedConstraintId)
+{
     if (similarityMatrix.empty() || beatTimestamps.empty())
-    {
         return;
-    }
     
-    DBG(" ");
-    DBG("=== Performing FULL Retarget ===");
+    // For segmented retarget, if the path doesn't exist yet, do a full one instead
+    if (!isFullRetarget && retargetedBeatPath.empty())
+        isFullRetarget = true;
+
     auto startTime = juce::Time::getMillisecondCounterHiRes();
-    
-    // Ensure constraints are sorted
+
+    // Always sort constraints, it's cheap and safe
     std::sort(userConstraints.begin(), userConstraints.end(),
               [](const ConstraintPoint& a, const ConstraintPoint& b) {
                   return a.targetTime < b.targetTime;
               });
-    
-    // Calculate duration from the last constraint (End Anchor)
-    float targetDuration = userConstraints.back().targetTime;
-    if (targetDuration <= 0.0f)
+
+    int changedIdx = -1;
+    if (!isFullRetarget)
     {
-        targetDuration = static_cast<float>(getOriginalTotalLengthSecs());
+        for (size_t i = 0; i < userConstraints.size(); ++i)
+        {
+            if (userConstraints[i].id == changedConstraintId)
+            {
+                changedIdx = static_cast<int>(i);
+                break;
+            }
+        }
+        // If constraint not found, fall back to a full retarget
+        if (changedIdx < 0)
+            isFullRetarget = true;
     }
+
+    if (isFullRetarget)
+    {
+        DBG(" ");
+        DBG("=== Performing FULL Retarget ===");
+    }
+    else
+    {
+        DBG(" ");
+        DBG("=== Performing SEGMENTED Retarget for constraint ID " << changedConstraintId << " ===");
+    }
+
+    // 1. ==================================================================
+    // Setup common variables and lambdas
     
-    // Calculate seconds per beat
     float secondsPerBeat = 0.5f;
     if (beatTimestamps.size() > 1)
     {
-        secondsPerBeat = static_cast<float>((beatTimestamps.back() - beatTimestamps.front()) / 
-                                            (beatTimestamps.size() - 1));
+        secondsPerBeat = static_cast<float>((beatTimestamps.back() - beatTimestamps.front()) / (beatTimestamps.size() - 1));
     }
     
     int numBeats = static_cast<int>(similarityMatrix.size());
     std::vector<float> beatsFloat(beatTimestamps.begin(), beatTimestamps.end());
     
-    // Penalties
     float similarityPenalty = 0.95f;
-    float backwardJumpPenalty = 0.8f;
-    float timeContinuityPenalty = 0.7f;
-    // Interior soft constraint penalties (if we had any non-boundary constraints)
-    // But here we treat ALL user constraints as boundaries (Hard Constraints)
-    float constraintTimePenalty = 0.0f;
-    float constraintBeatPenalty = 0.0f;
-    
-    std::vector<int> fullPath;
+    float backwardJumpPenalty = 0.1f;
+    float timeContinuityPenalty = 0.1f;
+    int beatTolerance = 20;
     
     auto getStepForTime = [secondsPerBeat](float time) -> int {
         return static_cast<int>(time / secondsPerBeat);
@@ -952,9 +1007,40 @@ void DynamicMusicVstAudioProcessor::performFullRetarget()
         return bestBeatIdx;
     };
 
-    // Chain retargeting segments between every pair of constraints
-    // This treats EVERY user constraint as a HARD ANCHOR
-    for (size_t i = 0; i < userConstraints.size() - 1; ++i)
+    auto getBeatForStep = [&](int step) -> int {
+        if (step < 0) return 0;
+        if (step >= static_cast<int>(retargetedBeatPath.size()))
+            return retargetedBeatPath.empty() ? 0 : retargetedBeatPath.back();
+        return retargetedBeatPath[step];
+    };
+
+    // 2. ==================================================================
+    // Determine processing range and initialize path
+    
+    int startRangeIdx = 0;
+    int endRangeIdx = static_cast<int>(userConstraints.size()) - 1;
+    
+    std::vector<int> newPath;
+    if (!isFullRetarget)
+    {
+        newPath = retargetedBeatPath;
+        startRangeIdx = (changedIdx > 0) ? changedIdx - 1 : changedIdx;
+        endRangeIdx = (changedIdx < static_cast<int>(userConstraints.size()) - 1) ? changedIdx + 1 : changedIdx;
+    }
+
+    // 3. ==================================================================
+    // Process segments in the determined range
+
+    int lockedPreviousEndBeat = -1;
+    if (!isFullRetarget && startRangeIdx > 0)
+    {
+        int step = getStepForTime(userConstraints[startRangeIdx].targetTime);
+        lockedPreviousEndBeat = getBeatForStep(step);
+    }
+    
+    std::vector<int> pathSegments; // Used for building path from scratch in full retarget
+
+    for (int i = startRangeIdx; i < endRangeIdx; ++i)
     {
         const auto& startConst = userConstraints[i];
         const auto& endConst = userConstraints[i+1];
@@ -962,248 +1048,93 @@ void DynamicMusicVstAudioProcessor::performFullRetarget()
         int startStep = getStepForTime(startConst.targetTime);
         int endStep = getStepForTime(endConst.targetTime);
         
-        // For start/end anchors, force exact beat indices if possible
-        int startBeat = findClosestBeat(startConst.sourceTime);
-        int endBeat = findClosestBeat(endConst.sourceTime);
-        
-        // Special case for global start/end to be exact
-        if (i == 0 && startConst.id == 0) startBeat = 0;
-        if (i == userConstraints.size() - 2 && endConst.id == 1) endBeat = numBeats - 1;
-
-        startStep = juce::jmax(0, startStep);
-        // Allow path to grow if needed, but usually limited by targetDuration
-        
-        if (endStep > startStep)
+        if (!isFullRetarget)
         {
-            std::vector<ConstraintPoint> emptySoftConstraints; // No soft constraints inside segments
-            
-            // Extend endStep by 1 so the segment includes the end anchor step
-            // This allows the DP to find a smooth transition TO the anchor beat at the exact time
-            auto result = audioRetargeter.retargetSegment(
-                similarityMatrix, beatsFloat,
-                startStep, endStep + 1,
-                startBeat, endBeat,
-                secondsPerBeat,
-                emptySoftConstraints,
-                similarityPenalty, backwardJumpPenalty, timeContinuityPenalty,
-                constraintTimePenalty, constraintBeatPenalty
-            );
-            
-            // Append to full path
-            // If fullPath is not empty, the new segment's first sample overlaps with the last sample
-            // of the previous segment (both are the anchor beat). We skip the first sample of the new segment.
-            if (!fullPath.empty() && !result.path.empty())
-            {
-                fullPath.insert(fullPath.end(), result.path.begin() + 1, result.path.end());
-            }
+            // Clamp steps for segmented updates
+            startStep = juce::jmax(0, startStep);
+            endStep = juce::jmin(static_cast<int>(retargetedBeatPath.size()) - 1, endStep);
+        }
+        else
+        {
+            startStep = juce::jmax(0, startStep);
+        }
+        
+        if (endStep <= startStep) continue;
+
+        int startBeat, endBeat, startTolerance, endTolerance;
+
+        // --- Determine Start Beat & Tolerance ---
+        if (lockedPreviousEndBeat != -1)
+        {
+            startBeat = lockedPreviousEndBeat;
+            startTolerance = 0;
+        }
+        else
+        {
+            bool isGlobalStart = (i == 0 && startConst.id == 0);
+            startBeat = isFullRetarget ? findClosestBeat(startConst.sourceTime) : getBeatForStep(startStep);
+            if (isFullRetarget && isGlobalStart) startBeat = 0;
+            startTolerance = (isFullRetarget && !isGlobalStart) ? beatTolerance : 0;
+        }
+
+        // --- Determine End Beat & Tolerance ---
+        bool isChangedConstraint = !isFullRetarget && (i + 1 == changedIdx);
+        bool isGlobalEnd = (i + 1 == userConstraints.size() - 1 && endConst.id == 1);
+
+        if (isChangedConstraint)
+        {
+            endBeat = findClosestBeat(endConst.sourceTime);
+            endTolerance = beatTolerance;
+        }
+        else
+        {
+            endBeat = isFullRetarget ? findClosestBeat(endConst.sourceTime) : getBeatForStep(endStep);
+            if (isFullRetarget && isGlobalEnd) endBeat = numBeats - 1;
+            endTolerance = (isFullRetarget && !isGlobalEnd) ? beatTolerance : 0;
+        }
+        
+        // --- Execute Retargeting ---
+        auto result = audioRetargeter.retargetSegment(
+            similarityMatrix, beatsFloat,
+            startStep, endStep + 1,
+            startBeat, endBeat,
+            secondsPerBeat,
+            similarityPenalty, backwardJumpPenalty, timeContinuityPenalty,
+            startTolerance, endTolerance
+        );
+        
+        lockedPreviousEndBeat = result.actualEndBeat;
+
+        // --- Update Path ---
+        if (isFullRetarget)
+        {
+            if (!pathSegments.empty() && !result.path.empty())
+                pathSegments.insert(pathSegments.end(), result.path.begin() + 1, result.path.end());
             else
+                pathSegments.insert(pathSegments.end(), result.path.begin(), result.path.end());
+        }
+        else
+        {
+            for (size_t j = 0; j < result.path.size(); ++j)
             {
-                fullPath.insert(fullPath.end(), result.path.begin(), result.path.end());
+                int targetIdx = startStep + static_cast<int>(j);
+                if (targetIdx < newPath.size())
+                    newPath[targetIdx] = result.path[j];
             }
         }
     }
-    
-    retargetedBeatPath = fullPath;
-    
-    createRetargetedAudio(retargetedBeatPath);
-    
-    DBG("Full retarget completed in " << juce::String(juce::Time::getMillisecondCounterHiRes() - startTime, 2) << " ms");
-}
 
-void DynamicMusicVstAudioProcessor::performSegmentedRetarget(int changedConstraintId)
-{
-    if (similarityMatrix.empty() || beatTimestamps.empty() || retargetedBeatPath.empty())
-    {
-        // No existing path - need full retarget
-        performFullRetarget();
-        return;
-    }
+    // 4. ==================================================================
+    // Finalize and apply the new path
     
-    DBG(" ");
-    DBG("=== Performing SEGMENTED Retarget for constraint ID " << changedConstraintId << " ===");
-    auto startTime = juce::Time::getMillisecondCounterHiRes();
-    
-    // Find the changed constraint and its neighbors
-    // Constraints should already be sorted by targetTime
-    int changedIdx = -1;
-    for (size_t i = 0; i < userConstraints.size(); ++i)
-    {
-        if (userConstraints[i].id == changedConstraintId)
-        {
-            changedIdx = static_cast<int>(i);
-            break;
-        }
-    }
-    
-    if (changedIdx < 0)
-    {
-        DBG("Constraint not found, performing full retarget");
-        performFullRetarget();
-        return;
-    }
-    
-    // Calculate seconds per beat
-    float secondsPerBeat = 0.5f;  // Default
-    if (beatTimestamps.size() > 1)
-    {
-        secondsPerBeat = static_cast<float>((beatTimestamps.back() - beatTimestamps.front()) / 
-                                            (beatTimestamps.size() - 1));
-    }
-    
-    int numBeats = static_cast<int>(similarityMatrix.size());
-    std::vector<float> beatsFloat(beatTimestamps.begin(), beatTimestamps.end());
-    
-    // Penalties
-    float similarityPenalty = 0.95f;
-    float backwardJumpPenalty = 0.7f;
-    float timeContinuityPenalty = 0.4f;
-    float constraintTimePenalty = 0.2f;
-    float constraintBeatPenalty = 0.2f;
-    
-    // We need to update segments on both sides of the changed constraint
-    // Left segment: from previous neighbor to changed constraint
-    // Right segment: from changed constraint to next neighbor
-    
-    auto getStepForTime = [secondsPerBeat](float time) -> int {
-        return static_cast<int>(time / secondsPerBeat);
-    };
-    
-    auto getBeatForStep = [&](int step) -> int {
-        if (step < 0) return 0;
-        if (step >= static_cast<int>(retargetedBeatPath.size())) 
-            return retargetedBeatPath.empty() ? 0 : retargetedBeatPath.back();
-        return retargetedBeatPath[step];
-    };
-    
-    // Find closest beat index for a source time
-    auto findClosestBeat = [&beatsFloat, numBeats](float sourceTime) -> int {
-        int bestBeatIdx = 0;
-        float minDiff = std::numeric_limits<float>::max();
-        for (int b = 0; b < numBeats; ++b)
-        {
-            float diff = std::abs(beatsFloat[b] - sourceTime);
-            if (diff < minDiff)
-            {
-                minDiff = diff;
-                bestBeatIdx = b;
-            }
-        }
-        return bestBeatIdx;
-    };
-    
-    std::vector<int> newPath = retargetedBeatPath;
-    
-    // Process left segment if there's a previous neighbor
-    if (changedIdx > 0)
-    {
-        const auto& leftNeighbor = userConstraints[changedIdx - 1];
-        const auto& changedConstraint = userConstraints[changedIdx];
-        
-        int startStep = getStepForTime(leftNeighbor.targetTime);
-        int endStep = getStepForTime(changedConstraint.targetTime);
-        int startBeat = findClosestBeat(leftNeighbor.sourceTime);
-        int endBeat = findClosestBeat(changedConstraint.sourceTime);
-        
-        // Clamp steps to valid range
-        startStep = juce::jmax(0, startStep);
-        endStep = juce::jmin(static_cast<int>(retargetedBeatPath.size()) - 1, endStep);
-        
-        if (endStep > startStep)
-        {
-            // Collect interior constraints for this segment
-            std::vector<ConstraintPoint> segmentConstraints;
-            for (const auto& c : userConstraints)
-            {
-                int cStep = getStepForTime(c.targetTime);
-                if (cStep > startStep && cStep < endStep)
-                {
-                    segmentConstraints.push_back(c);
-                }
-            }
-            
-            // Extend endStep by 1 to include the anchor step
-            auto leftResult = audioRetargeter.retargetSegment(
-                similarityMatrix, beatsFloat,
-                startStep, endStep + 1,
-                startBeat, endBeat,
-                secondsPerBeat,
-                segmentConstraints,
-                similarityPenalty, backwardJumpPenalty, timeContinuityPenalty,
-                constraintTimePenalty, constraintBeatPenalty
-            );
-            
-            // Splice left segment result into path
-            // We update the range [startStep, endStep] (inclusive)
-            // leftResult covers indices [0, endStep-startStep] which map to steps [startStep, endStep]
-            for (size_t i = 0; i < leftResult.path.size(); ++i)
-            {
-                int targetIdx = startStep + static_cast<int>(i);
-                if (targetIdx < newPath.size())
-                {
-                    newPath[targetIdx] = leftResult.path[i];
-                }
-            }
-        }
-    }
-    
-    // Process right segment if there's a next neighbor
-    if (changedIdx < static_cast<int>(userConstraints.size()) - 1)
-    {
-        const auto& changedConstraint = userConstraints[changedIdx];
-        const auto& rightNeighbor = userConstraints[changedIdx + 1];
-        
-        int startStep = getStepForTime(changedConstraint.targetTime);
-        int endStep = getStepForTime(rightNeighbor.targetTime);
-        int startBeat = findClosestBeat(changedConstraint.sourceTime);
-        int endBeat = findClosestBeat(rightNeighbor.sourceTime);
-        
-        // Clamp steps
-        startStep = juce::jmax(0, startStep);
-        endStep = juce::jmin(static_cast<int>(retargetedBeatPath.size()) - 1, endStep);
-        
-        if (endStep > startStep)
-        {
-            // Collect interior constraints for this segment
-            std::vector<ConstraintPoint> segmentConstraints;
-            for (const auto& c : userConstraints)
-            {
-                int cStep = getStepForTime(c.targetTime);
-                if (cStep > startStep && cStep < endStep)
-                {
-                    segmentConstraints.push_back(c);
-                }
-            }
-            
-            // Extend endStep by 1 to include the anchor step
-            auto rightResult = audioRetargeter.retargetSegment(
-                similarityMatrix, beatsFloat,
-                startStep, endStep + 1,
-                startBeat, endBeat,
-                secondsPerBeat,
-                segmentConstraints,
-                similarityPenalty, backwardJumpPenalty, timeContinuityPenalty,
-                constraintTimePenalty, constraintBeatPenalty
-            );
-            
-            // Splice right segment result into path
-            // We update the range [startStep, endStep]
-            // rightResult covers indices [0, endStep-startStep] which map to steps [startStep, endStep]
-            for (size_t i = 0; i < rightResult.path.size(); ++i)
-            {
-                int targetIdx = startStep + static_cast<int>(i);
-                if (targetIdx < newPath.size())
-                {
-                    newPath[targetIdx] = rightResult.path[i];
-                }
-            }
-        }
-    }
-    
-    retargetedBeatPath = newPath;
-    
+    retargetedBeatPath = isFullRetarget ? pathSegments : newPath;
     createRetargetedAudio(retargetedBeatPath);
     
-    DBG("Segmented retarget completed in " << juce::String(juce::Time::getMillisecondCounterHiRes() - startTime, 2) << " ms");
+    const auto duration = juce::String(juce::Time::getMillisecondCounterHiRes() - startTime, 2);
+    if (isFullRetarget)
+        DBG("Full retarget completed in " << duration << " ms");
+    else
+        DBG("Segmented retarget completed in " << duration << " ms");
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()

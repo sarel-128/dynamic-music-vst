@@ -113,6 +113,7 @@ public:
 private:
     void createRetargetedAudio(const std::vector<int>& path);
     void performSegmentedRetarget(int changedConstraintId);
+    void performRetarget(bool isFullRetarget, int changedConstraintId);
     double fileSampleRate = 44100.0; // Default, will be updated on file load
     float crossfadeMs { 20.0f };
     

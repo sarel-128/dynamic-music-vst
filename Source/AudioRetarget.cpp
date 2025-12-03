@@ -18,13 +18,11 @@ AudioRetargeter::RetargetResult AudioRetargeter::retargetDuration(const std::vec
                                                    float similarityPenalty,
                                                    float backwardJumpPenalty,
                                                    float timeContinuityPenalty,
-                                                   float constraintTimePenalty,
-                                                   float constraintBeatPenalty,
                                                    const std::vector<std::pair<float, float>>& timeConstraints)
 {
     if (beats.empty() || targetDuration <= 0.0f)
     {
-        return { {}, std::numeric_limits<float>::infinity() };
+        return { {}, std::numeric_limits<float>::infinity(), -1, -1 };
     }
     
     DBG(" ");
@@ -44,52 +42,12 @@ AudioRetargeter::RetargetResult AudioRetargeter::retargetDuration(const std::vec
     }
 
     int targetNumBeats = static_cast<int>(targetDuration / secondsPerBeat);
-    if (targetNumBeats <= 0) return { {}, std::numeric_limits<float>::infinity() };
+    if (targetNumBeats <= 0) return { {}, std::numeric_limits<float>::infinity(), -1, -1 };
 
     int numBeats = static_cast<int>(similarityMatrix.size());
-    if (numBeats == 0) return { {}, std::numeric_limits<float>::infinity() };
+    if (numBeats == 0) return { {}, std::numeric_limits<float>::infinity(), -1, -1 };
 
-    // Parse constraints into a list of points
     auto stepStartTime = juce::Time::getMillisecondCounterHiRes();
-    struct ConstraintPoint { int step; int beat; };
-    std::vector<ConstraintPoint> constraintPoints;
-
-    if (!timeConstraints.empty())
-    {
-        for (const auto& c : timeConstraints)
-        {
-            float srcTime = c.first;
-            float tgtTime = c.second;
-
-            // Find closest beat index for source time
-            int bestBeatIdx = 0;
-            float minDiff = std::numeric_limits<float>::max();
-            for (int b = 0; b < (int)beats.size(); ++b)
-            {
-                float diff = std::abs(beats[b] - srcTime);
-                if (diff < minDiff)
-                {
-                    minDiff = diff;
-                    bestBeatIdx = b;
-                }
-            }
-            if (bestBeatIdx >= numBeats) bestBeatIdx = numBeats - 1;
-
-            // Find step index for target time
-            int stepIdx = static_cast<int>(tgtTime / secondsPerBeat);
-            if (stepIdx < 0) stepIdx = 0;
-            if (stepIdx >= targetNumBeats) stepIdx = targetNumBeats - 1;
-
-            constraintPoints.push_back({stepIdx, bestBeatIdx});
-        }
-    }
-    else
-    {
-        // Default constraints if none provided: Start -> Start, End -> End
-        constraintPoints.push_back({0, 0});
-        constraintPoints.push_back({targetNumBeats - 1, numBeats - 1});
-    }
-    DBG("1. Constraint Parsing: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
 
     // DP table for costs
     std::vector<std::vector<float>> cost(targetNumBeats, std::vector<float>(numBeats, std::numeric_limits<float>::infinity()));
@@ -97,23 +55,11 @@ AudioRetargeter::RetargetResult AudioRetargeter::retargetDuration(const std::vec
     std::vector<std::vector<int>> path(targetNumBeats, std::vector<int>(numBeats, -1));
 
     // Initialization
-    stepStartTime = juce::Time::getMillisecondCounterHiRes();
     for (int j = 0; j < numBeats; ++j)
     {
-        // Calculate initial cost based on constraints (soft start)
-        float minWeightedDist = std::numeric_limits<float>::max();
-        for (const auto& pt : constraintPoints)
-        {
-             // Distance at step 0
-            float dTime = std::abs((float)0 - pt.step) / (float)targetNumBeats;
-            float dBeat = std::abs((float)j - pt.beat) / (float)numBeats;
-            
-            float wDist = std::sqrt(std::pow(constraintTimePenalty * dTime, 2) + std::pow(constraintBeatPenalty * dBeat, 2));
-            if (wDist < minWeightedDist) minWeightedDist = wDist;
-        }
-        cost[0][j] = minWeightedDist;
+        cost[0][j] = 0.0f;
     }
-    DBG("2. DP Initialization: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
+    DBG("1. DP Initialization: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
 
     // Fill DP table
     stepStartTime = juce::Time::getMillisecondCounterHiRes();
@@ -134,22 +80,6 @@ AudioRetargeter::RetargetResult AudioRetargeter::retargetDuration(const std::vec
 
                 // Penalty for deviating from the ideal time curve (Global Linear Guide)
                 float timeDeviationCost = timeContinuityPenalty * std::abs((float)j - idealBeatIndex) / (float)numBeats;
-                
-                // Soft Constraint Penalty (Local Attractors)
-                float constraintCost = 0.0f;
-                if (!constraintPoints.empty())
-                {
-                    float minWeightedDist = std::numeric_limits<float>::max();
-                    for (const auto& pt : constraintPoints)
-                    {
-                        float dTime = std::abs((float)i - pt.step) / (float)targetNumBeats;
-                        float dBeat = std::abs((float)j - pt.beat) / (float)numBeats;
-                        
-                        float wDist = std::sqrt(std::pow(constraintTimePenalty * dTime, 2) + std::pow(constraintBeatPenalty * dBeat, 2));
-                        if (wDist < minWeightedDist) minWeightedDist = wDist;
-                    }
-                    constraintCost = minWeightedDist;
-                }
 
                 for (int k = std::max(0, j - searchWindowRadius); k < std::min(numBeats, j + searchWindowRadius); ++k)
                 {
@@ -159,18 +89,13 @@ AudioRetargeter::RetargetResult AudioRetargeter::retargetDuration(const std::vec
                     float dist = 1.0f - similarityMatrix[k + 1][j];
                     float transitionCost = similarityPenalty * dist;
 
-                    if (j < k) // Backward jump
+                    // Penalize backward jumps and staying at the same beat (no forward progress)
+                    if (j <= k)
                     {
-                        int jumpDistance = k - j;
-                        // Penalty decreases as jump distance increases (prefer longer loops)
-                        // User example: distance 20 -> cost 0.2. This implies Cost = 4.0 / Distance.
-                        // We'll use backwardJumpPenalty as a base scaler.
-                        // If backwardJumpPenalty is ~0.7-1.0, multiplying by 5.0 gives ~3.5-5.0 range.
-                        transitionCost += (backwardJumpPenalty * 5.0f) / (float)jumpDistance;
-                    
+                        transitionCost += backwardJumpPenalty;
                     }
 
-                    float currentCost = cost[i - 1][k] + transitionCost + timeDeviationCost + constraintCost;
+                    float currentCost = cost[i - 1][k] + transitionCost + timeDeviationCost;
 
                     if (currentCost < minCost)
                     {
@@ -200,7 +125,7 @@ AudioRetargeter::RetargetResult AudioRetargeter::retargetDuration(const std::vec
             f.get();
         }
     }
-    DBG("3. Fill DP Table: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
+    DBG("2. Fill DP Table: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
 
     // Backtrack to find the best path
     stepStartTime = juce::Time::getMillisecondCounterHiRes();
@@ -231,16 +156,18 @@ AudioRetargeter::RetargetResult AudioRetargeter::retargetDuration(const std::vec
         }
         else
         {
-             return { {}, std::numeric_limits<float>::infinity() };
+             return { {}, std::numeric_limits<float>::infinity(), -1, -1 };
         }
     }
-    DBG("4. Backtracking: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
+    DBG("3. Backtracking: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
     DBG("Total internal time: " << juce::String(juce::Time::getMillisecondCounterHiRes() - functionStartTime, 2) << " ms");
     DBG("-----------------------------");
 
 
     // Return average cost per beat
-    return { resultPath, finalCost / (float)targetNumBeats };
+    int actualStart = resultPath.empty() ? -1 : resultPath[0];
+    int actualEnd = resultPath.empty() ? -1 : resultPath[targetNumBeats - 1];
+    return { resultPath, finalCost / (float)targetNumBeats, actualStart, actualEnd };
 }
 
 AudioRetargeter::RetargetResult AudioRetargeter::retargetSegment(
@@ -251,65 +178,55 @@ AudioRetargeter::RetargetResult AudioRetargeter::retargetSegment(
     int startBeat,
     int endBeat,
     float secondsPerBeat,
-    const std::vector<ConstraintPoint>& constraintsInSegment,
     float similarityPenalty,
     float backwardJumpPenalty,
     float timeContinuityPenalty,
-    float constraintTimePenalty,
-    float constraintBeatPenalty)
+    int startBeatTolerance,
+    int endBeatTolerance)
 {
     int numSteps = endStep - startStep;
     if (numSteps <= 0)
     {
-        return { {}, 0.0f };
+        return { {}, 0.0f, startBeat, endBeat };
     }
 
     int numBeats = static_cast<int>(similarityMatrix.size());
     if (numBeats == 0 || startBeat < 0 || endBeat < 0 || startBeat >= numBeats || endBeat >= numBeats)
     {
-        return { {}, std::numeric_limits<float>::infinity() };
+        return { {}, std::numeric_limits<float>::infinity(), -1, -1 };
     }
 
     DBG(" ");
     DBG("--- Inside retargetSegment ---");
-    DBG("Segment: steps " << startStep << "-" << endStep << ", beats " << startBeat << "->" << endBeat);
+    DBG("Segment: steps " << startStep << "-" << endStep << ", beats " << startBeat << "->" << endBeat 
+        << " (start tolerance: ±" << startBeatTolerance << ", end tolerance: ±" << endBeatTolerance << " beats)");
     auto functionStartTime = juce::Time::getMillisecondCounterHiRes();
-
-    // Parse constraints relative to this segment
-    struct LocalConstraint { int localStep; int beat; };
-    std::vector<LocalConstraint> localConstraints;
-    
-    for (const auto& c : constraintsInSegment)
-    {
-        // Convert target time to step index
-        int stepIdx = static_cast<int>(c.targetTime / secondsPerBeat);
-        int localStep = stepIdx - startStep;
-        
-        // Find closest beat for source time
-        int bestBeatIdx = 0;
-        float minDiff = std::numeric_limits<float>::max();
-        for (int b = 0; b < numBeats; ++b)
-        {
-            float diff = std::abs(beats[b] - c.sourceTime);
-            if (diff < minDiff)
-            {
-                minDiff = diff;
-                bestBeatIdx = b;
-            }
-        }
-        
-        if (localStep > 0 && localStep < numSteps - 1)  // Only include interior constraints
-        {
-            localConstraints.push_back({localStep, bestBeatIdx});
-        }
-    }
 
     // DP table sized for this segment
     std::vector<std::vector<float>> cost(numSteps, std::vector<float>(numBeats, std::numeric_limits<float>::infinity()));
     std::vector<std::vector<int>> path(numSteps, std::vector<int>(numBeats, -1));
 
-    // Initialization: force start at startBeat
-    cost[0][startBeat] = 0.0f;
+    // Initialization: start beat handling with tolerance
+    int actualStartBeat = startBeat;
+    
+    if (startBeatTolerance > 0)
+    {
+        // Allow starting within tolerance range of startBeat
+        int startBeatMin = std::max(0, startBeat - startBeatTolerance);
+        int startBeatMax = std::min(numBeats - 1, startBeat + startBeatTolerance);
+        
+        for (int j = startBeatMin; j <= startBeatMax; ++j)
+        {
+            // Small penalty proportional to distance from ideal anchor
+            float distancePenalty = std::abs(j - startBeat) * 0.01f;
+            cost[0][j] = distancePenalty;
+        }
+    }
+    else
+    {
+        // No tolerance - must start at exact beat (locked from previous segment)
+        cost[0][startBeat] = 0.0f;
+    }
 
     const int searchWindowRadius = numBeats;
 
@@ -337,21 +254,6 @@ AudioRetargeter::RetargetResult AudioRetargeter::retargetSegment(
                 float timeDeviationCost = isBackwardSegment ? 0.0f : 
                     timeContinuityPenalty * std::abs((float)j - idealBeatIndex) / (float)numBeats;
 
-                // Soft constraint penalty
-                float constraintCost = 0.0f;
-                if (!localConstraints.empty())
-                {
-                    float minWeightedDist = std::numeric_limits<float>::max();
-                    for (const auto& lc : localConstraints)
-                    {
-                        float dTime = std::abs((float)i - lc.localStep) / (float)numSteps;
-                        float dBeat = std::abs((float)j - lc.beat) / (float)numBeats;
-                        float wDist = std::sqrt(std::pow(constraintTimePenalty * dTime, 2) + std::pow(constraintBeatPenalty * dBeat, 2));
-                        if (wDist < minWeightedDist) minWeightedDist = wDist;
-                    }
-                    constraintCost = minWeightedDist;
-                }
-
                 for (int k = std::max(0, j - searchWindowRadius); k < std::min(numBeats, j + searchWindowRadius); ++k)
                 {
                     if (k + 1 >= numBeats) continue;
@@ -360,24 +262,13 @@ AudioRetargeter::RetargetResult AudioRetargeter::retargetSegment(
                     float dist = 1.0f - similarityMatrix[k + 1][j];
                     float transitionCost = similarityPenalty * dist;
 
-                    if (j < k) // Backward jump
+                    // Penalize backward jumps and staying at the same beat (no forward progress)
+                    if (j <= k)
                     {
-                        int jumpDistance = k - j;
-                        if (jumpDistance < 4) // Prevent very short loops (stuttering)
-                        {
-                             transitionCost = std::numeric_limits<float>::infinity();
-                        }
-                        else
-                        {
-                            // Penalty decreases as jump distance increases (prefer longer loops)
-                            // User example: distance 20 -> cost 0.2. This implies Cost = 4.0 / Distance.
-                            // We'll use backwardJumpPenalty as a base scaler.
-                            // If backwardJumpPenalty is ~0.7-1.0, multiplying by 5.0 gives ~3.5-5.0 range.
-                            transitionCost += (backwardJumpPenalty * 5.0f) / (float)jumpDistance;
-                        }
+                        transitionCost += backwardJumpPenalty;
                     }
 
-                    float currentCost = cost[i - 1][k] + transitionCost + timeDeviationCost + constraintCost;
+                    float currentCost = cost[i - 1][k] + transitionCost + timeDeviationCost;
 
                     if (currentCost < minCost)
                     {
@@ -409,39 +300,82 @@ AudioRetargeter::RetargetResult AudioRetargeter::retargetSegment(
     }
     DBG("Segment DP Fill: " << juce::String(juce::Time::getMillisecondCounterHiRes() - stepStartTime, 2) << " ms");
 
-    // Backtrack from endBeat at the final step
+    // Backtrack from best beat (with or without tolerance at end)
     std::vector<int> resultPath(numSteps);
-    float finalCost = cost[numSteps - 1][endBeat];
-
-    if (finalCost == std::numeric_limits<float>::infinity())
+    
+    float bestCost = std::numeric_limits<float>::infinity();
+    int bestEnd = endBeat;
+    int actualEndBeat = endBeat;
+    
+    if (endBeatTolerance > 0)
     {
-        DBG("Warning: No valid path found to endBeat, falling back to min cost endpoint");
-        // Find best available endpoint
-        float bestCost = std::numeric_limits<float>::infinity();
-        int bestEnd = endBeat;
-        for (int j = 0; j < numBeats; ++j)
+        // Find the best endpoint within tolerance range
+        int endBeatMin = std::max(0, endBeat - endBeatTolerance);
+        int endBeatMax = std::min(numBeats - 1, endBeat + endBeatTolerance);
+        
+        for (int j = endBeatMin; j <= endBeatMax; ++j)
         {
-            if (cost[numSteps - 1][j] < bestCost)
+            // Add small penalty for distance from ideal anchor
+            float distancePenalty = std::abs(j - endBeat) * 0.01f;
+            float totalCost = cost[numSteps - 1][j] + distancePenalty;
+            
+            if (totalCost < bestCost)
             {
-                bestCost = cost[numSteps - 1][j];
+                bestCost = totalCost;
                 bestEnd = j;
             }
         }
-        finalCost = bestCost;
-        resultPath[numSteps - 1] = bestEnd;
+        
+        // If no valid path found in tolerance range, search entire space
+        if (bestCost == std::numeric_limits<float>::infinity())
+        {
+            DBG("Warning: No valid path found within tolerance, searching entire space");
+            for (int j = 0; j < numBeats; ++j)
+            {
+                if (cost[numSteps - 1][j] < bestCost)
+                {
+                    bestCost = cost[numSteps - 1][j];
+                    bestEnd = j;
+                }
+            }
+        }
     }
     else
     {
-        resultPath[numSteps - 1] = endBeat;
+        // No tolerance - must end at exact beat
+        bestCost = cost[numSteps - 1][endBeat];
+        bestEnd = endBeat;
+        
+        // Fallback if exact beat has no valid path
+        if (bestCost == std::numeric_limits<float>::infinity())
+        {
+            DBG("Warning: No valid path to exact endBeat, searching entire space");
+            for (int j = 0; j < numBeats; ++j)
+            {
+                if (cost[numSteps - 1][j] < bestCost)
+                {
+                    bestCost = cost[numSteps - 1][j];
+                    bestEnd = j;
+                }
+            }
+        }
     }
+    
+    float finalCost = bestCost;
+    actualEndBeat = bestEnd;
+    resultPath[numSteps - 1] = bestEnd;
 
     for (int i = numSteps - 1; i > 0; --i)
     {
         resultPath[i - 1] = path[i][resultPath[i]];
     }
+    
+    // Update actual start beat from the path
+    actualStartBeat = resultPath[0];
 
+    DBG("Actual beats used: start=" << actualStartBeat << ", end=" << actualEndBeat);
     DBG("Total segment retarget time: " << juce::String(juce::Time::getMillisecondCounterHiRes() - functionStartTime, 2) << " ms");
     DBG("-----------------------------");
 
-    return { resultPath, finalCost / (float)numSteps };
+    return { resultPath, finalCost / (float)numSteps, actualStartBeat, actualEndBeat };
 }

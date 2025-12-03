@@ -40,22 +40,35 @@ public:
                 auto proportion = juce::jlimit(0.0, 1.0, retargetedLengthSecs / originalLengthSecs);
                 waveformVisibleWidth = (int)(getWidth() * proportion);
 
-                juce::Path path;
-                
                 const auto numSamples = buffer.getNumSamples();
                 const auto* channelData = buffer.getReadPointer(0); // Draw mono for simplicity
-
-                const float xScale = (float)waveformVisibleWidth / numSamples;
-                const float yScale = getHeight() * 0.5f;
-
-                path.startNewSubPath(0, yScale);
-
-                for (int i = 0; i < numSamples; ++i)
-                {
-                    path.lineTo(i * xScale, yScale - channelData[i] * yScale);
-                }
                 
-                g.strokePath(path, juce::PathStrokeType(1.0f));
+                const float yScale = getHeight() * 0.5f;
+                const float yCentre = getHeight() * 0.5f;
+                
+                // Draw envelope: for each pixel column, find min/max in that sample range
+                for (int x = 0; x < waveformVisibleWidth; ++x)
+                {
+                    int startSample = (int)((float)x / waveformVisibleWidth * numSamples);
+                    int endSample = (int)((float)(x + 1) / waveformVisibleWidth * numSamples);
+                    endSample = juce::jmin(endSample, numSamples);
+                    
+                    float minVal = 0.0f;
+                    float maxVal = 0.0f;
+                    
+                    // Find min and max in this range
+                    for (int i = startSample; i < endSample; ++i)
+                    {
+                        float sample = channelData[i];
+                        minVal = juce::jmin(minVal, sample);
+                        maxVal = juce::jmax(maxVal, sample);
+                    }
+                    
+                    // Draw vertical line from min to max
+                    float y1 = yCentre - maxVal * yScale;
+                    float y2 = yCentre - minVal * yScale;
+                    g.drawVerticalLine(x, y1, y2);
+                }
             }
         }
         else if (audioProcessor.getTotalLengthSecs() > 0)
