@@ -253,6 +253,12 @@ void DynamicMusicVstAudioProcessor::setPlaybackPositionFromSource(double sourceP
     const juce::ScopedLock lock(sourcePlaybackLock);
     isPlayingFromSource.store(true);
     sourcePlaybackPosition.store(sourcePositionSecs);
+    
+    // Start playback if not already playing
+    if (!retargetedTransportSource.isPlaying())
+    {
+        retargetedTransportSource.start();
+    }
 }
 
 bool DynamicMusicVstAudioProcessor::isPlaying() const
