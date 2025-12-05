@@ -23,6 +23,10 @@ target_sources(DynamicMusicVst PRIVATE
     Source/PluginProcessor.h
     Source/PluginEditor.cpp
     Source/PluginEditor.h
+    Source/TimelineComponent.cpp
+    Source/TimelineComponent.h
+    Source/SourceOverviewComponent.cpp
+    Source/SourceOverviewComponent.h
     Source/AudioAnalysis.cpp
     Source/AudioAnalysis.h
     Source/AudioRetarget.cpp

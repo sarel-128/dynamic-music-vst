@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include <set>
 
 juce::AudioProcessorValueTreeState::ParameterLayout DynamicMusicVstAudioProcessor::createParameterLayout()
 {
@@ -51,10 +52,15 @@ DynamicMusicVstAudioProcessor::DynamicMusicVstAudioProcessor()
 {
     formatManager.registerBasicFormats();
     audioThumbnail.addChangeListener(this);
+    
+    // Start background retargeting thread
+    retargetThread = std::make_unique<RetargetThread>(*this);
+    retargetThread->startThread();
 }
 
 DynamicMusicVstAudioProcessor::~DynamicMusicVstAudioProcessor()
 {
+    retargetThread->stopThread(2000);
     audioThumbnail.removeChangeListener(this);
 }
 
@@ -120,6 +126,9 @@ void DynamicMusicVstAudioProcessor::changeProgramName (int index, const juce::St
 
 void DynamicMusicVstAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    hostSampleRate = sampleRate;
+    hostSamplesPerBlock = samplesPerBlock;
+    
     sourceAudioBuffer.setSize(getTotalNumInputChannels(), (int)(sampleRate * 30)); // Pre-allocate for up to 30s of audio
     sourceAudioBuffer.clear();
 
@@ -191,86 +200,59 @@ void DynamicMusicVstAudioProcessor::loadAudioFile(const juce::File& file)
         audioThumbnail.setSource(new juce::FileInputSource(file));
         isPlayingFile = true;
         nextBeatToPlay = 0;
+        
+        // --- Trigger Analysis ---
+        // With the new interactive UI, analysis should happen automatically on load.
+        analysisState = AnalysisState::AnalysisNeeded;
+        
+        sendChangeMessage(); // Notify listeners (like the editor) that the main buffer has changed.
     }
+    isRetargeted = false;
+    
+    // Also initialize the retargeted buffer and transport source with the original audio
+    // so it's playable before any retargeting happens.
+    retargetedAudioBuffer.makeCopyOf(sourceAudioBuffer);
+    retargetedMemorySource = std::make_unique<juce::MemoryAudioSource>(retargetedAudioBuffer, false);
+    retargetedTransportSource.prepareToPlay(hostSamplesPerBlock, hostSampleRate);
+    retargetedTransportSource.setSource(retargetedMemorySource.get(), 0, nullptr, fileSampleRate);
+    
+    sendChangeMessage();
 }
 
 void DynamicMusicVstAudioProcessor::startPlayback()
-{
-    const juce::ScopedLock lock (transportSourceLock);
-
-    if (isRetargeted.load())
     {
         retargetedTransportSource.start();
-        currentPlaybackPositionSecs = retargetedTransportSource.getCurrentPosition();
-    }
-    else
-    {
-        fileTransportSource.start();
-        currentPlaybackPositionSecs = fileTransportSource.getCurrentPosition();
-    }
-
-    // Reset retargeting playback position
-    currentRetargetBeatIndex = 0;
-    samplesIntoCurrentBeat = 0;
-
-
-    // Find the next beat to play from the current position
-    double currentTime = getCurrentPositionSecs();
-    nextBeatToPlay = 0;
-    for (size_t i = 0; i < beatTimestamps.size(); ++i)
-    {
-        if (beatTimestamps[i] >= currentTime)
-        {
-            nextBeatToPlay = (int)i;
-            break;
-        }
-    }
 }
 
 void DynamicMusicVstAudioProcessor::stopPlayback()
 {
-    const juce::ScopedLock lock (transportSourceLock);
-    
-    fileTransportSource.stop();
     retargetedTransportSource.stop();
+    isPlayingFromSource.store(false);  // Clear source playback mode when stopping
+}
 
-    nextBeatToPlay = 0;
-
-    // Reset retargeting playback position
-    currentRetargetBeatIndex = 0;
-    samplesIntoCurrentBeat = 0;
+double DynamicMusicVstAudioProcessor::getCurrentPlaybackPosition() const
+{
+    // Return source position if in source playback mode
+    if (isPlayingFromSource.load())
+    {
+        return sourcePlaybackPosition.load();
+    }
+    return retargetedTransportSource.getCurrentPosition();
 }
 
 void DynamicMusicVstAudioProcessor::setPlaybackPosition(double newPositionSecs)
 {
-    const juce::ScopedLock lock (transportSourceLock);
-    
-    if (isRetargeted.load())
-    {
+        // Disable source playback mode when seeking from target view
+        isPlayingFromSource.store(false);
         retargetedTransportSource.setPosition(newPositionSecs);
-        currentPlaybackPositionSecs = newPositionSecs;
-    }
-    else
-    {
-        fileTransportSource.setPosition(newPositionSecs);
-        currentPlaybackPositionSecs = newPositionSecs;
-    }
+}
 
-    // This is tricky for retargeted audio. For now, we'll just reset.
-    // A proper implementation would need to map the timeline position to the retargeted path.
-    currentRetargetBeatIndex = 0;
-    samplesIntoCurrentBeat = 0;
-    
-    // Find the next beat to play from the new position
-    nextBeatToPlay = 0;
-    for (size_t i = 0; i < beatTimestamps.size(); ++i)
-    {
-        if (beatTimestamps[i] >= newPositionSecs)
-        {
-            nextBeatToPlay = (int)i;
-            break;
-        }
-    }
+void DynamicMusicVstAudioProcessor::setPlaybackPositionFromSource(double sourcePositionSecs)
+{
+    // Enable source playback mode and set position
+    const juce::ScopedLock lock(sourcePlaybackLock);
+    isPlayingFromSource.store(true);
+    sourcePlaybackPosition.store(sourcePositionSecs);
 }
 
 bool DynamicMusicVstAudioProcessor::isPlaying() const
@@ -302,6 +284,23 @@ double DynamicMusicVstAudioProcessor::getOriginalTotalLengthSecs() const
     const juce::ScopedLock lock (transportSourceLock);
     return fileTransportSource.getLengthInSeconds();
 }
+
+void DynamicMusicVstAudioProcessor::retargetWithHandles(const std::vector<Handle>& handles)
+{
+    // TODO: This is where the real audio processing will be triggered.
+    // For now, we'll just log the handles to confirm the connection is working.
+    DBG("Processor received retarget request with " + juce::String(handles.size()) + " handles.");
+    for(const auto& handle : handles)
+    {
+        DBG("  Handle " + juce::String(handle.id) + ": Source " + juce::String(handle.sourceTime, 2)
+            + "s -> Dest " + juce::String(handle.destinationTime, 2) + "s");
+    }
+
+    // This would eventually be an async task.
+    // After processing, it would update the manipulatedAudioBuffer
+    // and call sendChangeMessage() to notify the editor.
+}
+
 
 void DynamicMusicVstAudioProcessor::releaseResources()
 {
@@ -338,91 +337,75 @@ void DynamicMusicVstAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
     for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
         buffer.clear (i, 0, buffer.getNumSamples());
         
-    // If we're playing a file, get its audio and replace the input
-    if (isPlayingFile && fileReaderSource != nullptr)
-    {
-        if (isRetargeted.load())
-        {
-            // --- Retargeted Playback from generated buffer ---
-            const juce::ScopedLock lock (transportSourceLock);
-            juce::AudioSourceChannelInfo channelInfo(&buffer, 0, buffer.getNumSamples());
-            retargetedTransportSource.getNextAudioBlock(channelInfo);
-            // The visual playhead is now driven by the editor timer, which calls getCurrentPositionSecs().
-            // We just need to update the internal position for other logic if needed.
-            currentPlaybackPositionSecs = retargetedTransportSource.getCurrentPosition();
+    // --- Handle one-shot scrub playback ---
+    // The snippetLock here ensures that the UI thread isn't resizing the buffer
+    // while the audio thread is trying to read from it.
+    const juce::ScopedLock sl(snippetLock);
+    auto snippetNumSamples = scrubSnippetBuffer.getNumSamples();
+    auto currentReadPos = scrubSnippetReadPos.load();
 
-        }
-        else if (!retargetedBeatPath.empty() && !beatTimestamps.empty())
+    if (currentReadPos < snippetNumSamples)
         {
-            // --- Retargeted Playback Logic ---
-            int samplesToProcess = buffer.getNumSamples();
-            int bufferWritePos = 0;
-
-            while (samplesToProcess > 0)
+        auto numSamplesToRead = juce::jmin(buffer.getNumSamples(), snippetNumSamples - currentReadPos);
+        
+        for (int channel = 0; channel < totalNumOutputChannels; ++channel)
             {
-                if (currentRetargetBeatIndex >= retargetedBeatPath.size())
+            if (channel < scrubSnippetBuffer.getNumChannels())
                 {
-                    // Reached end of retargeted path, fill remainder with silence
-                    buffer.clear(bufferWritePos, samplesToProcess);
-                    break;
-                }
-
-                int originalBeatIndex = retargetedBeatPath[currentRetargetBeatIndex];
-                
-                double beatStartSecs = beatTimestamps[originalBeatIndex];
-                double nextBeatStartSecs;
-                if (originalBeatIndex + 1 < beatTimestamps.size())
-                {
-                    nextBeatStartSecs = beatTimestamps[originalBeatIndex + 1];
-                }
-                else
-                {
-                    nextBeatStartSecs = getTotalLengthSecs(); // Last beat goes to end of file
-                }
-
-                int beatStartSample = static_cast<int>(beatStartSecs * fileSampleRate);
-                int nextBeatStartSample = static_cast<int>(nextBeatStartSecs * fileSampleRate);
-                int beatNumSamples = nextBeatStartSample - beatStartSample;
-
-                if (beatNumSamples <= 0)
-                {
-                    currentRetargetBeatIndex++;
-                    samplesIntoCurrentBeat = 0;
-                    continue;
-                }
-                
-                // Update visual playback position
-                currentPlaybackPositionSecs = beatStartSecs + (double)samplesIntoCurrentBeat / fileSampleRate;
-
-                int samplesAvailableInBeat = beatNumSamples - samplesIntoCurrentBeat;
-                int samplesToCopy = juce::jmin(samplesToProcess, samplesAvailableInBeat);
-
-                if (samplesToCopy > 0)
-                {
-                    for (int ch = 0; ch < sourceAudioBuffer.getNumChannels(); ++ch)
-                    {
-                        buffer.copyFrom(ch, bufferWritePos, sourceAudioBuffer, ch, beatStartSample + samplesIntoCurrentBeat, samplesToCopy);
+                // Add the snippet to the output buffer instead of copying to allow main playback to continue underneath if desired
+                buffer.addFrom(channel, 0, scrubSnippetBuffer, channel, currentReadPos, numSamplesToRead);
                     }
-                    
-                    bufferWritePos += samplesToCopy;
-                    samplesToProcess -= samplesToCopy;
-                    samplesIntoCurrentBeat += samplesToCopy;
+        }
+        
+        scrubSnippetReadPos.store(currentReadPos + numSamplesToRead);
                 }
-
-                if (samplesIntoCurrentBeat >= beatNumSamples)
+    
+    // --- Regular playback ---
+    // Skip regular playback if we're scrubbing (flag provides instant response)
+    if (!isScrubbing.load() && retargetedTransportSource.isPlaying())
                 {
-                    currentRetargetBeatIndex++;
-                    samplesIntoCurrentBeat = 0;
+        // Check if we're in source playback mode (playing gray areas)
+        if (isPlayingFromSource.load())
+        {
+            // Play directly from source buffer
+            const juce::ScopedLock lock(sourcePlaybackLock);
+            auto currentPos = sourcePlaybackPosition.load();
+            int startSample = static_cast<int>(currentPos * fileSampleRate);
+            
+            if (startSample >= 0 && startSample < sourceAudioBuffer.getNumSamples())
+                {
+                int samplesToRead = juce::jmin(buffer.getNumSamples(), 
+                                                sourceAudioBuffer.getNumSamples() - startSample);
+                
+                for (int channel = 0; channel < totalNumOutputChannels; ++channel)
+                {
+                    if (channel < sourceAudioBuffer.getNumChannels())
+                    {
+                        buffer.copyFrom(channel, 0, sourceAudioBuffer, channel, startSample, samplesToRead);
+                    }
                 }
+                
+                // Update position for next block
+                sourcePlaybackPosition.store(currentPos + (samplesToRead / fileSampleRate));
+                
+                // Check if we've reached the end of the buffer or should switch back to retargeted
+                if (startSample + samplesToRead >= sourceAudioBuffer.getNumSamples())
+                {
+                    isPlayingFromSource.store(false);
+                    retargetedTransportSource.stop();
+                }
+            }
+            else
+            {
+                // Invalid position, switch back to retargeted playback
+                isPlayingFromSource.store(false);
             }
         }
         else
         {
-            // --- Standard Linear Playback ---
-            const juce::ScopedLock lock (transportSourceLock);
-            juce::AudioSourceChannelInfo channelInfo(&buffer, 0, buffer.getNumSamples());
-            fileTransportSource.getNextAudioBlock(channelInfo);
-            currentPlaybackPositionSecs = fileTransportSource.getCurrentPosition();
+            // Normal retargeted playback
+            juce::AudioSourceChannelInfo bufferToFill(buffer);
+            retargetedTransportSource.getNextAudioBlock(bufferToFill);
         }
     }
         
@@ -661,6 +644,108 @@ void DynamicMusicVstAudioProcessor::setStateInformation (const void* data, int s
             parameters.replaceState (juce::ValueTree::fromXml (*xmlState));
 }
 
+double DynamicMusicVstAudioProcessor::getSourceTimeAt(double targetTime) const
+{
+    // If not retargeted, the mapping is 1:1 (identity)
+    if (!isRetargeted.load() || retargetedBeatPath.empty())
+        return targetTime;
+
+    // 1. Convert targetTime to step index
+    // Note: using currentSecondsPerBeat which was set during retargeting
+    int step = static_cast<int>(targetTime / currentSecondsPerBeat);
+
+    // 2. Clamp step to valid range
+    if (step < 0) step = 0;
+    if (step >= static_cast<int>(retargetedBeatPath.size()))
+        step = static_cast<int>(retargetedBeatPath.size()) - 1;
+
+    // 3. Look up source beat index
+    int sourceBeatIndex = retargetedBeatPath[step];
+
+    // 4. Convert source beat index to source time
+    if (sourceBeatIndex >= 0 && sourceBeatIndex < static_cast<int>(beatTimestamps.size()))
+    {
+        return beatTimestamps[sourceBeatIndex];
+    }
+
+    return 0.0;
+}
+
+std::vector<double> DynamicMusicVstAudioProcessor::getTargetTimesAt(double sourceTime) const
+{
+    std::vector<double> targetTimes;
+    
+    if (!isRetargeted.load() || retargetedBeatPath.empty() || beatTimestamps.empty())
+    {
+        targetTimes.push_back(sourceTime);
+        return targetTimes;
+    }
+
+    // 1. Find closest source beat index
+    int bestBeatIdx = 0;
+    float minDiff = std::numeric_limits<float>::max();
+    for (size_t b = 0; b < beatTimestamps.size(); ++b)
+    {
+        float diff = std::abs((float)beatTimestamps[b] - (float)sourceTime);
+        if (diff < minDiff)
+        {
+            minDiff = diff;
+            bestBeatIdx = static_cast<int>(b);
+        }
+    }
+
+    // 2. Iterate through path to find all occurrences
+    for (size_t step = 0; step < retargetedBeatPath.size(); ++step)
+    {
+        if (retargetedBeatPath[step] == bestBeatIdx)
+        {
+            // Convert step to target time
+            targetTimes.push_back(step * currentSecondsPerBeat);
+        }
+    }
+
+    // 3. If the beat wasn't found in the path (it's in a skipped/gray region),
+    // find the next beat that IS in the path and return its target time(s).
+    // This is the "landing point" of the jump that skipped this region.
+    if (targetTimes.empty())
+    {
+        // Search for the smallest beat index in the path that's greater than bestBeatIdx
+        int nextUsedBeat = -1;
+        for (int pathBeat : retargetedBeatPath)
+        {
+            if (pathBeat > bestBeatIdx)
+            {
+                if (nextUsedBeat == -1 || pathBeat < nextUsedBeat)
+                {
+                    nextUsedBeat = pathBeat;
+                }
+            }
+        }
+        
+        // If we found a next beat, return all its occurrences
+        if (nextUsedBeat != -1)
+        {
+            for (size_t step = 0; step < retargetedBeatPath.size(); ++step)
+            {
+                if (retargetedBeatPath[step] == nextUsedBeat)
+                {
+                    targetTimes.push_back(step * currentSecondsPerBeat);
+                }
+            }
+        }
+        else
+        {
+            // Fallback: if no next beat exists (shouldn't happen), return the last step
+            if (!retargetedBeatPath.empty())
+            {
+                targetTimes.push_back((retargetedBeatPath.size() - 1) * currentSecondsPerBeat);
+            }
+        }
+    }
+
+    return targetTimes;
+}
+
 void DynamicMusicVstAudioProcessor::createRetargetedAudio(const std::vector<int>& path)
 {
     if (path.empty() || beatTimestamps.empty())
@@ -820,114 +905,70 @@ int DynamicMusicVstAudioProcessor::addConstraint(float sourceTime, float targetT
 void DynamicMusicVstAudioProcessor::moveConstraint(int id, float newSourceTime, float newTargetTime)
 {
     // Special handling for start anchor (id=0): cannot be moved
-    if (id == 0)
-    {
-        DBG("Start anchor cannot be moved");
-        return;
-    }
+    if (id == 0) return;
     
-    for (auto& c : userConstraints)
     {
-        if (c.id == id)
+        const juce::ScopedLock lock(constraintLock);
+        
+        for (auto& c : userConstraints)
         {
-            // Special handling for end anchor (id=1): only X-axis (targetTime) can change
-            if (id == 1)
+            if (c.id == id)
             {
-                // Keep sourceTime fixed at original end, only update targetTime
-                c.targetTime = newTargetTime;
-                DBG("End anchor moved to targetTime: " << newTargetTime);
-            }
-            else
-            {
-                // Regular constraint: both axes can change
                 c.sourceTime = newSourceTime;
                 c.targetTime = newTargetTime;
+                break;
             }
-            break;
         }
-    }
+        
+        // Re-sort by targetTime
+        std::sort(userConstraints.begin(), userConstraints.end(),
+                  [](const ConstraintPoint& a, const ConstraintPoint& b) {
+                      return a.targetTime < b.targetTime;
+                  });
+    } // Unlock
     
-    // Re-sort by targetTime
-    std::sort(userConstraints.begin(), userConstraints.end(),
-              [](const ConstraintPoint& a, const ConstraintPoint& b) {
-                  return a.targetTime < b.targetTime;
-              });
-    
-    // Special handling for End Anchor (id=1): it changes path length
-    if (id == 1)
-    {
-        // Calculate new path length based on new target duration
-        float secondsPerBeat = 0.5f;
-        if (beatTimestamps.size() > 1)
-        {
-            secondsPerBeat = static_cast<float>((beatTimestamps.back() - beatTimestamps.front()) / 
-                                                (beatTimestamps.size() - 1));
-        }
-        
-        int newPathLength = static_cast<int>(newTargetTime / secondsPerBeat);
-        if (newPathLength <= 0) newPathLength = 1;
-        
-        int oldPathLength = static_cast<int>(retargetedBeatPath.size());
-        
-        if (newPathLength != oldPathLength)
-        {
-            DBG("Resizing path from " << oldPathLength << " to " << newPathLength << " steps");
-            
-            if (newPathLength > oldPathLength)
-            {
-                // Path is getting longer - extend with the last beat (will be overwritten by segmented retarget)
-                int lastBeat = retargetedBeatPath.empty() ? 0 : retargetedBeatPath.back();
-                retargetedBeatPath.resize(newPathLength, lastBeat);
-            }
-            else
-            {
-                // Path is getting shorter - truncate
-                retargetedBeatPath.resize(newPathLength);
-            }
-        }
-        
-        // Now use segmented retarget to update ONLY the last segment
-        performSegmentedRetarget(id);
-    }
-    else
-    {
-        // Regular constraints can use segmented retarget
-        performSegmentedRetarget(id);
-    }
+    // Request background update
+    lastChangedConstraintId.store(id);
+    isFullRetargetNeeded.store(false);
+    retargetNeeded.store(true);
+    // retargetThread will pick this up
 }
 
 void DynamicMusicVstAudioProcessor::removeConstraint(int id)
 {
     // Start and end anchors (id 0 and 1) cannot be removed
-    if (id == 0 || id == 1)
-    {
-        DBG("Start and end anchors cannot be removed");
-        return;
-    }
+    if (id == 0 || id == 1) return;
     
-    auto it = std::find_if(userConstraints.begin(), userConstraints.end(),
-                           [id](const ConstraintPoint& c) { return c.id == id; });
-    
-    if (it != userConstraints.end())
     {
-        userConstraints.erase(it);
+        const juce::ScopedLock lock(constraintLock);
+        auto it = std::find_if(userConstraints.begin(), userConstraints.end(),
+                               [id](const ConstraintPoint& c) { return c.id == id; });
         
-        // After removing, perform full retarget (simpler than segmented for removal)
-        performFullRetarget();
-    }
-}
-
-void DynamicMusicVstAudioProcessor::performFullRetarget()
-{
-    performRetarget(true, -1);
+        if (it != userConstraints.end())
+        {
+            userConstraints.erase(it);
+        }
+    } // Unlock
+    
+    // Request full background update
+    isFullRetargetNeeded.store(true);
+    retargetNeeded.store(true);
 }
 
 void DynamicMusicVstAudioProcessor::performSegmentedRetarget(int changedConstraintId)
 {
-    performRetarget(false, changedConstraintId);
+    const juce::ScopedLock lock(constraintLock);
+    performRetarget(false, changedConstraintId, userConstraints);
 }
 
-void DynamicMusicVstAudioProcessor::performRetarget(bool isFullRetarget, int changedConstraintId)
+void DynamicMusicVstAudioProcessor::performFullRetarget()
+{
+    // If called from UI, use lock and call performRetarget
+    const juce::ScopedLock lock(constraintLock);
+    performRetarget(true, -1, userConstraints);
+}
+
+void DynamicMusicVstAudioProcessor::performRetarget(bool isFullRetarget, int changedConstraintId, const std::vector<ConstraintPoint>& activeConstraints)
 {
     if (similarityMatrix.empty() || beatTimestamps.empty())
         return;
@@ -938,18 +979,14 @@ void DynamicMusicVstAudioProcessor::performRetarget(bool isFullRetarget, int cha
 
     auto startTime = juce::Time::getMillisecondCounterHiRes();
 
-    // Always sort constraints, it's cheap and safe
-    std::sort(userConstraints.begin(), userConstraints.end(),
-              [](const ConstraintPoint& a, const ConstraintPoint& b) {
-                  return a.targetTime < b.targetTime;
-              });
+    // activeConstraints are already sorted by the caller (thread or main)
 
     int changedIdx = -1;
     if (!isFullRetarget)
     {
-        for (size_t i = 0; i < userConstraints.size(); ++i)
+        for (size_t i = 0; i < activeConstraints.size(); ++i)
         {
-            if (userConstraints[i].id == changedConstraintId)
+            if (activeConstraints[i].id == changedConstraintId)
             {
                 changedIdx = static_cast<int>(i);
                 break;
@@ -979,6 +1016,9 @@ void DynamicMusicVstAudioProcessor::performRetarget(bool isFullRetarget, int cha
     {
         secondsPerBeat = static_cast<float>((beatTimestamps.back() - beatTimestamps.front()) / (beatTimestamps.size() - 1));
     }
+    
+    // Update member variable for cursor mapping
+    currentSecondsPerBeat = secondsPerBeat;
     
     int numBeats = static_cast<int>(similarityMatrix.size());
     std::vector<float> beatsFloat(beatTimestamps.begin(), beatTimestamps.end());
@@ -1018,14 +1058,24 @@ void DynamicMusicVstAudioProcessor::performRetarget(bool isFullRetarget, int cha
     // Determine processing range and initialize path
     
     int startRangeIdx = 0;
-    int endRangeIdx = static_cast<int>(userConstraints.size()) - 1;
+    int endRangeIdx = static_cast<int>(activeConstraints.size()) - 1;
     
     std::vector<int> newPath;
     if (!isFullRetarget)
     {
+        // IMPORTANT: When performing a segmented retarget, especially for the end handle,
+        // we must ensure the new path vector has the correct size for the NEW target duration.
+        // The previous logic was clamping the endStep to the OLD path size, preventing extension,
+        // and not shrinking the vector when shortening.
+        
+        int expectedTotalSteps = getStepForTime(activeConstraints.back().targetTime) + 1;
         newPath = retargetedBeatPath;
+        
+        if (newPath.size() != expectedTotalSteps)
+            newPath.resize(expectedTotalSteps, newPath.empty() ? 0 : newPath.back());
+            
         startRangeIdx = (changedIdx > 0) ? changedIdx - 1 : changedIdx;
-        endRangeIdx = (changedIdx < static_cast<int>(userConstraints.size()) - 1) ? changedIdx + 1 : changedIdx;
+        endRangeIdx = (changedIdx < static_cast<int>(activeConstraints.size()) - 1) ? changedIdx + 1 : changedIdx;
     }
 
     // 3. ==================================================================
@@ -1034,7 +1084,7 @@ void DynamicMusicVstAudioProcessor::performRetarget(bool isFullRetarget, int cha
     int lockedPreviousEndBeat = -1;
     if (!isFullRetarget && startRangeIdx > 0)
     {
-        int step = getStepForTime(userConstraints[startRangeIdx].targetTime);
+        int step = getStepForTime(activeConstraints[startRangeIdx].targetTime);
         lockedPreviousEndBeat = getBeatForStep(step);
     }
     
@@ -1042,17 +1092,17 @@ void DynamicMusicVstAudioProcessor::performRetarget(bool isFullRetarget, int cha
 
     for (int i = startRangeIdx; i < endRangeIdx; ++i)
     {
-        const auto& startConst = userConstraints[i];
-        const auto& endConst = userConstraints[i+1];
+        const auto& startConst = activeConstraints[i];
+        const auto& endConst = activeConstraints[i+1];
         
         int startStep = getStepForTime(startConst.targetTime);
         int endStep = getStepForTime(endConst.targetTime);
         
         if (!isFullRetarget)
         {
-            // Clamp steps for segmented updates
+            // Clamp startStep, but allow endStep to go up to the newly resized boundary
             startStep = juce::jmax(0, startStep);
-            endStep = juce::jmin(static_cast<int>(retargetedBeatPath.size()) - 1, endStep);
+            endStep = juce::jmin(static_cast<int>(newPath.size()) - 1, endStep);
         }
         else
         {
@@ -1079,7 +1129,7 @@ void DynamicMusicVstAudioProcessor::performRetarget(bool isFullRetarget, int cha
 
         // --- Determine End Beat & Tolerance ---
         bool isChangedConstraint = !isFullRetarget && (i + 1 == changedIdx);
-        bool isGlobalEnd = (i + 1 == userConstraints.size() - 1 && endConst.id == 1);
+        bool isGlobalEnd = (i + 1 == activeConstraints.size() - 1 && endConst.id == 1);
 
         if (isChangedConstraint)
         {
@@ -1137,7 +1187,184 @@ void DynamicMusicVstAudioProcessor::performRetarget(bool isFullRetarget, int cha
         DBG("Segmented retarget completed in " << duration << " ms");
 }
 
+std::vector<std::pair<double, double>> DynamicMusicVstAudioProcessor::getUnusedSourceRegions() const
+{
+    std::vector<std::pair<double, double>> unusedRegions;
+    
+    if (beatTimestamps.empty() || retargetedBeatPath.empty())
+        return unusedRegions;
+    
+    // Create a set of all source beat indices that ARE used
+    std::set<int> usedBeats;
+    for (int beatIdx : retargetedBeatPath)
+    {
+        if (beatIdx >= 0 && beatIdx < (int)beatTimestamps.size())
+            usedBeats.insert(beatIdx);
+    }
+    
+    // Find contiguous ranges of unused beats
+    int numBeats = (int)beatTimestamps.size();
+    bool inUnusedRegion = false;
+    double regionStart = 0.0;
+    
+    for (int i = 0; i < numBeats; ++i)
+    {
+        bool isUsed = usedBeats.count(i) > 0;
+        
+        if (!isUsed && !inUnusedRegion)
+        {
+            // Start of unused region
+            regionStart = beatTimestamps[i];
+            inUnusedRegion = true;
+        }
+        else if (isUsed && inUnusedRegion)
+        {
+            // End of unused region
+            double regionEnd = beatTimestamps[i];
+            unusedRegions.push_back({regionStart, regionEnd});
+            inUnusedRegion = false;
+        }
+    }
+    
+    // Handle case where unused region extends to the end
+    if (inUnusedRegion)
+    {
+        double endTime = (double)sourceAudioBuffer.getNumSamples() / fileSampleRate;
+        unusedRegions.push_back({regionStart, endTime});
+    }
+    
+    return unusedRegions;
+}
+
+std::vector<DynamicMusicVstAudioProcessor::CutInfo> DynamicMusicVstAudioProcessor::getCuts() const
+{
+    std::vector<CutInfo> cuts;
+    
+    if (retargetedBeatPath.empty() || beatTimestamps.empty() || currentSecondsPerBeat <= 0)
+        return cuts;
+    
+    // Iterate through the retargeted path and find discontinuities
+    for (size_t i = 0; i < retargetedBeatPath.size() - 1; ++i)
+    {
+        int currentBeat = retargetedBeatPath[i];
+        int nextBeat = retargetedBeatPath[i + 1];
+        
+        // Check if there's a discontinuity (jump in source)
+        if (std::abs(nextBeat - currentBeat) > 1)
+        {
+            CutInfo cut;
+            
+            // Target time is where the cut appears in the timeline
+            cut.targetTime = (i + 1) * currentSecondsPerBeat;
+            
+            // Source times before and after the cut
+            if (currentBeat >= 0 && currentBeat < (int)beatTimestamps.size())
+                cut.sourceTimeFrom = beatTimestamps[currentBeat];
+            else
+                cut.sourceTimeFrom = 0.0;
+                
+            if (nextBeat >= 0 && nextBeat < (int)beatTimestamps.size())
+                cut.sourceTimeTo = beatTimestamps[nextBeat];
+            else
+                cut.sourceTimeTo = 0.0;
+            
+            // Calculate quality based on similarity matrix
+            cut.quality = 0.5f; // Default
+            
+            if (!similarityMatrix.empty() && 
+                currentBeat >= 0 && currentBeat < (int)similarityMatrix.size() &&
+                nextBeat >= 0 && nextBeat < (int)similarityMatrix[currentBeat].size())
+            {
+                cut.quality = similarityMatrix[currentBeat][nextBeat];
+            }
+            
+            cuts.push_back(cut);
+        }
+    }
+    
+    return cuts;
+}
+
+void DynamicMusicVstAudioProcessor::startScrubbing()
+{
+    // Set the flag immediately for instant response (non-blocking)
+    isScrubbing.store(true);
+    
+    // Don't stop playback - let scrubbing play on top of ongoing playback
+}
+
+void DynamicMusicVstAudioProcessor::stopScrubbing()
+{
+    // Clear the scrubbing flag
+    isScrubbing.store(false);
+    
+    // By setting the read position to the end, we ensure any playing snippet stops.
+    const juce::ScopedLock sl(snippetLock);
+    scrubSnippetReadPos.store(scrubSnippetBuffer.getNumSamples());
+}
+
+void DynamicMusicVstAudioProcessor::triggerScrubSnippet(double scrubPositionSecs)
+{
+    const juce::ScopedLock sl(snippetLock);
+    auto& source = retargetedAudioBuffer;
+    if (source.getNumSamples() == 0) return;
+
+    const int snippetLengthSamples = static_cast<int>(0.125 * fileSampleRate); // 125ms at any sample rate
+    int startSample = static_cast<int>(juce::jmax(0.0, scrubPositionSecs) * fileSampleRate);
+    startSample = juce::jmin(startSample, source.getNumSamples() - 1);
+    
+    int numSamplesToCopy = juce::jmin(snippetLengthSamples, source.getNumSamples() - startSample);
+
+    scrubSnippetBuffer.setSize(source.getNumChannels(), numSamplesToCopy, false, true, true);
+    
+    for (int channel = 0; channel < source.getNumChannels(); ++channel)
+    {
+        scrubSnippetBuffer.copyFrom(channel, 0, source, channel, startSample, numSamplesToCopy);
+    }
+
+    scrubSnippetReadPos.store(0);
+}
+
+void DynamicMusicVstAudioProcessor::triggerScrubSnippetFromSource(double scrubPositionSecs)
+{
+    const juce::ScopedLock sl(snippetLock);
+    auto& source = sourceAudioBuffer;
+    if (source.getNumSamples() == 0) return;
+
+    const int snippetLengthSamples = static_cast<int>(0.125 * fileSampleRate); // 125ms at any sample rate
+    int startSample = static_cast<int>(juce::jmax(0.0, scrubPositionSecs) * fileSampleRate);
+    startSample = juce::jmin(startSample, source.getNumSamples() - 1);
+    
+    int numSamplesToCopy = juce::jmin(snippetLengthSamples, source.getNumSamples() - startSample);
+
+    scrubSnippetBuffer.setSize(source.getNumChannels(), numSamplesToCopy, false, true, true);
+    
+    for (int channel = 0; channel < source.getNumChannels(); ++channel)
+    {
+        scrubSnippetBuffer.copyFrom(channel, 0, source, channel, startSample, numSamplesToCopy);
+    }
+
+    scrubSnippetReadPos.store(0);
+}
+
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
     return new DynamicMusicVstAudioProcessor();
+}
+
+void DynamicMusicVstAudioProcessor::performBackgroundRetarget()
+{
+    std::vector<ConstraintPoint> constraintsCopy;
+    int changedId = -1;
+    bool isFull = false;
+    
+    {
+        const juce::ScopedLock lock(constraintLock);
+        constraintsCopy = userConstraints;
+        changedId = lastChangedConstraintId.load();
+        isFull = isFullRetargetNeeded.load();
+    }
+    
+    // Now perform the heavy lifting without holding the lock
+    performRetarget(isFull, changedId, constraintsCopy);
 }

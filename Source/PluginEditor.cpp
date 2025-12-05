@@ -2,95 +2,153 @@
 #include "PluginEditor.h"
 
 DynamicMusicVstAudioProcessorEditor::DynamicMusicVstAudioProcessorEditor (DynamicMusicVstAudioProcessor& p, juce::AudioProcessorValueTreeState& vts)
-    : AudioProcessorEditor (&p), audioProcessor (p), valueTreeState(vts), waveformDisplay(p)
+    : AudioProcessorEditor (&p), audioProcessor (p), valueTreeState(vts)
 {
-    setSize (900, 900);
+    setSize (1000, 800);
+    setWantsKeyboardFocus(true); // Allow keyboard input
     audioProcessor.addChangeListener(this);
 
-    // Waveform Display
-    addAndMakeVisible(waveformDisplay);
+    addAndMakeVisible(sourceOverviewComponent);
+    addAndMakeVisible(timelineComponent);
 
-    // Similarity Matrix Display
-    addAndMakeVisible(similarityMatrixDisplay);
-
-    // Onset Envelope Display
-    //addAndMakeVisible(onsetEnvelopeDisplay);
-
-    // Tempogram Display
-    //addAndMakeVisible(tempogramDisplay);
-
-    // Show Similarity Matrix Toggle
-    showSimilarityMatrixButton.setButtonText("Show Similarity Matrix");
-    addAndMakeVisible(showSimilarityMatrixButton);
-    showSimilarityMatrixAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(valueTreeState, "showSimilarityMatrix", showSimilarityMatrixButton);
-    valueTreeState.addParameterListener("showSimilarityMatrix", this);
-    // Initial visibility for startup
-    similarityMatrixDisplay.setVisible(valueTreeState.getRawParameterValue("showSimilarityMatrix")->load());
-    
-    // Handle constraint events from UI
-    similarityMatrixDisplay.onConstraintAdded = [this](float sourceTime, float targetTime)
-    {
-        audioProcessor.addConstraint(sourceTime, targetTime);
-        // Sync display back from processor
-        similarityMatrixDisplay.updateConstraints(audioProcessor.getConstraints());
-        similarityMatrixDisplay.updatePath(audioProcessor.retargetedBeatPath);
+    // Set up callbacks from children to parent editor
+    sourceOverviewComponent.onHandleAddRequest = [this](double sourceTime) 
+    { 
+        auto targetTimes = audioProcessor.getTargetTimesAt(sourceTime);
+        if (!targetTimes.empty())
+        {
+            addHandle(sourceTime, targetTimes[0]); // Use first matching target time
+        }
+        else
+        {
+            // Fallback if no mapping exists (shouldn't happen in normal use)
+            addHandle(sourceTime, sourceTime);
+        }
     };
-    
-    similarityMatrixDisplay.onConstraintMoved = [this](int id, float newSourceTime, float newTargetTime)
+    sourceOverviewComponent.onHandleMoved = [this](int id, double newTime)
     {
-        audioProcessor.moveConstraint(id, newSourceTime, newTargetTime);
-        // Sync display back from processor
-        similarityMatrixDisplay.updateConstraints(audioProcessor.getConstraints());
-        similarityMatrixDisplay.updatePath(audioProcessor.retargetedBeatPath);
+        for (const auto& handle : handles)
+            if (handle.id == id)
+                moveHandle(id, newTime, handle.destinationTime);
     };
-    
-    similarityMatrixDisplay.onConstraintRemoved = [this](int id)
+    sourceOverviewComponent.onHandleDeleteRequest = [this](int id)
     {
-        audioProcessor.removeConstraint(id);
-        // Sync display back from processor
-        similarityMatrixDisplay.updateConstraints(audioProcessor.getConstraints());
-        similarityMatrixDisplay.updatePath(audioProcessor.retargetedBeatPath);
+        deleteHandle(id);
+    };
+    sourceOverviewComponent.onViewChanged = [this]() { repaint(); }; // Trigger repaint for wiring lines
+
+    timelineComponent.onHandleAddRequest = [this](double destTime) 
+    {
+        double sourceTime = audioProcessor.getSourceTimeAt(destTime);
+        addHandle(sourceTime, destTime); 
+    };
+    timelineComponent.onHandleMoved = [this](int id, double newTime)
+    {
+        for (const auto& handle : handles)
+            if (handle.id == id)
+                moveHandle(id, handle.sourceTime, newTime);
+    };
+    timelineComponent.onHandleDeleteRequest = [this](int id)
+    {
+        deleteHandle(id);
+    };
+    timelineComponent.onViewChanged = [this]() { repaint(); }; // Trigger repaint for wiring lines
+
+    // --- Cursor Synchronization ---
+    timelineComponent.onCursorMoved = [this](double time)
+    {
+        if (time < 0)
+        {
+             sourceOverviewComponent.setCursorPosition({});
+             return;
+        }
+        // Map target time -> source time
+        double sourceTime = audioProcessor.getSourceTimeAt(time);
+        sourceOverviewComponent.setCursorPosition({sourceTime});
     };
 
-    // Target Duration Slider
-    targetDurationAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(valueTreeState, "targetDuration", targetDurationSlider);
-    targetDurationSlider.setSliderStyle(juce::Slider::Rotary);
-    targetDurationSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 90, 20);
-    targetDurationSlider.setPopupDisplayEnabled(true, false, this);
-    targetDurationSlider.setTextValueSuffix(" s");
-    addAndMakeVisible(targetDurationSlider);
-    targetDurationLabel.setText("Target Duration", juce::dontSendNotification);
-    targetDurationLabel.setJustificationType(juce::Justification::centredRight);
-    addAndMakeVisible(targetDurationLabel);
+    sourceOverviewComponent.onCursorMoved = [this](double time)
+    {
+        if (time < 0)
+        {
+             timelineComponent.setCursorPosition({});
+             return;
+        }
+        // Map source time -> target times
+        std::vector<double> targetTimes = audioProcessor.getTargetTimesAt(time);
+        timelineComponent.setCursorPosition(targetTimes);
+    };
 
-    // Beat Tightness Slider
-    beatTightnessAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(valueTreeState, "beatTightness", beatTightnessSlider);
-    beatTightnessSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-    beatTightnessSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 90, 20);
-    beatTightnessSlider.setPopupDisplayEnabled(true, false, this);
-    addAndMakeVisible(beatTightnessSlider);
-    beatTightnessLabel.setText("Beat Tightness", juce::dontSendNotification);
-    beatTightnessLabel.setJustificationType(juce::Justification::centredRight);
-    addAndMakeVisible(beatTightnessLabel);
+    // --- Playhead Seeking & Scrubbing ---
+    timelineComponent.onSeekRequest = [this](double time) 
+    {
+        audioProcessor.setPlaybackPosition(time);
+    };
+    timelineComponent.onScrubStart = [this]() 
+    { 
+        isScrubbing = true;
+        audioProcessor.startScrubbing(); 
+    };
+    timelineComponent.onScrubRequest = [this](double time) 
+    { 
+        audioProcessor.triggerScrubSnippet(time);
+        // Update playhead position visually
+        timelineComponent.setPlayheadPosition(time);
+        double sourceTime = audioProcessor.getSourceTimeAt(time);
+        sourceOverviewComponent.setPlayheadPosition(sourceTime);
+    };
+    timelineComponent.onScrubEnd = [this]() 
+    { 
+        isScrubbing = false;
+        audioProcessor.stopScrubbing(); 
+    };
 
-    // Trim Sliders
-    trimStartAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(valueTreeState, "trimStart", trimStartSlider);
-    trimStartSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-    trimStartSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 90, 20);
-    trimStartSlider.setPopupDisplayEnabled(true, false, this);
-    addAndMakeVisible(trimStartSlider);
-    trimStartLabel.setText("Trim Start", juce::dontSendNotification);
-    trimStartLabel.setJustificationType(juce::Justification::centredRight);
-    addAndMakeVisible(trimStartLabel);
+    sourceOverviewComponent.onSeekRequest = [this](double time)
+    {
+        // When seeking from source view, play from source position directly
+        // This allows playing gray areas (unused regions)
+        audioProcessor.setPlaybackPositionFromSource(time);
+    };
+    sourceOverviewComponent.onScrubStart = [this]() 
+    { 
+        isScrubbing = true;
+        audioProcessor.startScrubbing(); 
+    };
+    sourceOverviewComponent.onScrubRequest = [this](double time)
+    {
+        // Play directly from source audio at the source time
+        audioProcessor.triggerScrubSnippetFromSource(time);
+        
+        // Update playhead position visually
+        sourceOverviewComponent.setPlayheadPosition(time);
+        
+        // Also update timeline playhead to show where this source time maps to
+        auto targetTimes = audioProcessor.getTargetTimesAt(time);
+        if (!targetTimes.empty())
+        {
+            timelineComponent.setPlayheadPosition(targetTimes[0]);
+        }
+    };
+    sourceOverviewComponent.onScrubEnd = [this]() 
+    { 
+        isScrubbing = false;
+        audioProcessor.stopScrubbing(); 
+    };
 
-    trimEndAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(valueTreeState, "trimEnd", trimEndSlider);
-    trimEndSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-    trimEndSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 90, 20);
-    trimEndSlider.setPopupDisplayEnabled(true, false, this);
-    addAndMakeVisible(trimEndSlider);
-    trimEndLabel.setText("Trim End", juce::dontSendNotification);
-    trimEndLabel.setJustificationType(juce::Justification::centredRight);
-    addAndMakeVisible(trimEndLabel);
+    // --- Handle Hovering ---
+    auto hoverCallback = [this](int handleId) {
+        if (hoveredHandleId != handleId)
+        {
+            hoveredHandleId = handleId;
+            timelineComponent.setHoveredHandle(handleId);
+            sourceOverviewComponent.setHoveredHandle(handleId);
+            repaint(); // Repaint editor to update connector line
+        }
+    };
+    timelineComponent.onHandleHoverChanged = hoverCallback;
+    sourceOverviewComponent.onHandleHoverChanged = hoverCallback;
+
+    // --- Keep essential controls ---
 
     // Open File Button
     openFileButton.setButtonText("Open Audio File");
@@ -106,36 +164,16 @@ DynamicMusicVstAudioProcessorEditor::DynamicMusicVstAudioProcessorEditor (Dynami
     stopButton.onClick = [this] { audioProcessor.stopPlayback(); };
     addAndMakeVisible(stopButton);
 
-    // Analyze Button
-    analyzeButton.setButtonText("Analyze!");
-    analyzeButton.onClick = [this] {
-        audioProcessor.analysisState = DynamicMusicVstAudioProcessor::AnalysisState::AnalysisNeeded;
-    };
-    addAndMakeVisible(analyzeButton);
-
-    // Retarget Button
-    retargetButton.setButtonText("Retarget");
-    retargetButton.onClick = [this] {
-        audioProcessor.retargetState = DynamicMusicVstAudioProcessor::RetargetState::RetargetingNeeded;
-    };
-    addAndMakeVisible(retargetButton);
-
     // Status Label
     statusLabel.setText("Ready", juce::dontSendNotification);
     statusLabel.setJustificationType(juce::Justification::centred);
     addAndMakeVisible(statusLabel);
     
-    // Tempo Label
-    tempoLabel.setText("BPM: -", juce::dontSendNotification);
-    tempoLabel.setJustificationType(juce::Justification::centred);
-    addAndMakeVisible(tempoLabel);
-
-    startTimerHz(60); // Poll 60 times per second for smoother animation
+    startTimerHz(30);
 }
 
 DynamicMusicVstAudioProcessorEditor::~DynamicMusicVstAudioProcessorEditor()
 {
-    valueTreeState.removeParameterListener("showSimilarityMatrix", this);
     audioProcessor.removeChangeListener(this);
     stopTimer();
 }
@@ -143,10 +181,47 @@ DynamicMusicVstAudioProcessorEditor::~DynamicMusicVstAudioProcessorEditor()
 void DynamicMusicVstAudioProcessorEditor::paint (juce::Graphics& g)
 {
     g.fillAll (getLookAndFeel().findColour (juce::ResizableWindow::backgroundColourId));
+}
 
-    g.setColour (juce::Colours::white);
-    g.setFont (15.0f);
-    g.drawFittedText ("Dynamic Music VST!!!", getLocalBounds().removeFromTop(25), juce::Justification::centred, 1);
+void DynamicMusicVstAudioProcessorEditor::paintOverChildren(juce::Graphics& g)
+{
+    // Draw wiring diagram
+    for (const auto& handle : handles)
+    {
+        auto topPos = sourceOverviewComponent.getBounds().getPosition().toFloat() + sourceOverviewComponent.getScreenPositionForHandle(handle.id);
+        auto bottomPos = timelineComponent.getBounds().getPosition().toFloat() + timelineComponent.getScreenPositionForHandle(handle.id);
+        
+        topPos.y = sourceOverviewComponent.getBounds().getBottom();
+        bottomPos.y = timelineComponent.getBounds().getY();
+
+        juce::Path path;
+        path.startNewSubPath(topPos);
+        path.cubicTo(topPos.x, topPos.y + 40, bottomPos.x, bottomPos.y - 40, bottomPos.x, bottomPos.y);
+
+        float thickness = (handle.id == hoveredHandleId) ? 2.5f : 1.5f;
+        juce::Colour colour = (handle.id == hoveredHandleId) ? juce::Colours::yellow : juce::Colours::lightgrey.withAlpha(0.7f);
+
+        g.setColour(colour);
+        g.strokePath(path, juce::PathStrokeType(thickness));
+    }
+}
+
+bool DynamicMusicVstAudioProcessorEditor::keyPressed(const juce::KeyPress& key)
+{
+    // Space bar toggles play/pause
+    if (key.isKeyCode(juce::KeyPress::spaceKey))
+    {
+        if (audioProcessor.isPlaying())
+        {
+            audioProcessor.stopPlayback();
+        }
+        else
+        {
+            audioProcessor.startPlayback();
+        }
+        return true; // Key was handled
+    }
+    return false; // Key was not handled
 }
 
 void DynamicMusicVstAudioProcessorEditor::openAudioFile()
@@ -164,172 +239,201 @@ void DynamicMusicVstAudioProcessorEditor::openAudioFile()
         {
             audioProcessor.loadAudioFile(file);
             statusLabel.setText("Loaded: " + file.getFileNameWithoutExtension(), juce::dontSendNotification);
+            
+            // Clear handles when a new file is loaded
+            handles.clear();
+            nextHandleId = 0;
+            addHandle(0, 0); // Add start handle
+            addHandle(audioProcessor.getOriginalTotalLengthSecs(), audioProcessor.getOriginalTotalLengthSecs()); // Add end handle
         }
     });
 }
 
 void DynamicMusicVstAudioProcessorEditor::timerCallback()
 {
-    waveformDisplay.repaint();
-
-    auto playheadRatio = audioProcessor.getTotalLengthSecs() > 0 ? (float)audioProcessor.getCurrentPositionSecs() / (float)audioProcessor.getTotalLengthSecs() : 0.0f;
-    similarityMatrixDisplay.setPlayheadPosition(playheadRatio);
-    similarityMatrixDisplay.setTargetDuration(targetDurationSlider.getValue());
-    //onsetEnvelopeDisplay.setPlayheadPosition(playheadRatio);
-    //tempogramDisplay.setPlayheadPosition(playheadRatio);
-
-    if (audioProcessor.getTotalLengthSecs() > 0)
+    // Don't update playhead position if we're actively scrubbing
+    if (isScrubbing)
+        return;
+    
+    double currentPos = audioProcessor.getCurrentPlaybackPosition();
+    
+    if (audioProcessor.isInSourcePlaybackMode())
     {
-        double totalSecs = audioProcessor.getTotalLengthSecs();
-        trimStartSlider.setTextValueSuffix(" s (" + juce::String(trimStartSlider.getValue() * totalSecs, 2) + ")");
-        trimEndSlider.setTextValueSuffix(" s (" + juce::String(trimEndSlider.getValue() * totalSecs, 2) + ")");
+        // In source playback mode, currentPos is the source position
+        // Source is leading, timeline is following
+        sourceOverviewComponent.setPlayheadIsLeading(true);
+        timelineComponent.setPlayheadIsLeading(false);
+        
+        sourceOverviewComponent.setPlayheadPosition(currentPos);
+        
+        // Map source position to target for timeline playhead
+        auto targetTimes = audioProcessor.getTargetTimesAt(currentPos);
+        if (!targetTimes.empty())
+        {
+            timelineComponent.setPlayheadPosition(targetTimes[0]);
+        }
     }
     else
     {
-        trimStartSlider.setTextValueSuffix(" s");
-        trimEndSlider.setTextValueSuffix(" s");
-    }
-
-    switch (audioProcessor.analysisState.load())
-    {
-        case DynamicMusicVstAudioProcessor::AnalysisState::Ready:
-            statusLabel.setText("Ready!", juce::dontSendNotification);
-            analyzeButton.setEnabled(true);
-            break;
-        case DynamicMusicVstAudioProcessor::AnalysisState::AnalysisNeeded:
-            statusLabel.setText("Analysis required", juce::dontSendNotification);
-            analyzeButton.setEnabled(true);
-            break;
-        case DynamicMusicVstAudioProcessor::AnalysisState::Analyzing:
-            statusLabel.setText("Analyzing...", juce::dontSendNotification);
-            analyzeButton.setEnabled(false); // Disable button while analyzing
-            break;
-        case DynamicMusicVstAudioProcessor::AnalysisState::AnalysisComplete:
-            statusLabel.setText("Analysis Complete!", juce::dontSendNotification);
-            tempoLabel.setText("BPM: " + juce::String(audioProcessor.estimatedBPM, 1), juce::dontSendNotification);
-            similarityMatrixDisplay.updateBeatInfo(audioProcessor.beatTimestamps, audioProcessor.getTotalLengthSecs());
-            similarityMatrixDisplay.updateMatrix(audioProcessor.similarityMatrix);
-            
-            // Initialize default constraints after analysis
-            audioProcessor.initializeDefaultConstraints();
-            similarityMatrixDisplay.updateConstraints(audioProcessor.getConstraints());
-            
-            // Run initial full retarget
-            audioProcessor.performFullRetarget();
-            similarityMatrixDisplay.updatePath(audioProcessor.retargetedBeatPath);
-            
-            //onsetEnvelopeDisplay.updateOnsetEnvelope(audioProcessor.onsetEnvelope);
-            //onsetEnvelopeDisplay.updateBeatInfo(audioProcessor.beatTimestamps, audioProcessor.getTotalLengthSecs());
-            //tempogramDisplay.updateDisplayInfo(audioProcessor.tempogram, audioProcessor.globalAcf, audioProcessor.getSampleRate(), 512);
-            audioProcessor.analysisState = DynamicMusicVstAudioProcessor::AnalysisState::Ready; // Reset state
-            break;
-    }
-
-    switch (audioProcessor.retargetState.load())
-    {
-        case DynamicMusicVstAudioProcessor::RetargetState::Ready:
-            retargetButton.setEnabled(true);
-            break;
-        case DynamicMusicVstAudioProcessor::RetargetState::RetargetingNeeded:
-            statusLabel.setText("Retargeting required", juce::dontSendNotification);
-            retargetButton.setEnabled(true);
-            break;
-        case DynamicMusicVstAudioProcessor::RetargetState::Retargeting:
-            statusLabel.setText("Retargeting...", juce::dontSendNotification);
-            retargetButton.setEnabled(false);
-            break;
-        case DynamicMusicVstAudioProcessor::RetargetState::RetargetingComplete:
-            statusLabel.setText("Retargeting Complete!", juce::dontSendNotification);
-            similarityMatrixDisplay.updatePath(audioProcessor.retargetedBeatPath);
-            similarityMatrixDisplay.updateConstraints(audioProcessor.getConstraints());
-            audioProcessor.retargetState = DynamicMusicVstAudioProcessor::RetargetState::Ready; // Reset state
-            break;
+        // Normal mode: currentPos is target position
+        // Timeline is leading, source is following
+        timelineComponent.setPlayheadIsLeading(true);
+        sourceOverviewComponent.setPlayheadIsLeading(false);
+        
+        timelineComponent.setPlayheadPosition(currentPos);
+        
+        double sourcePos = audioProcessor.getSourceTimeAt(currentPos);
+        sourceOverviewComponent.setPlayheadPosition(sourcePos);
     }
 }
 
-void DynamicMusicVstAudioProcessorEditor::parameterChanged(const juce::String &parameterID, float newValue)
+void DynamicMusicVstAudioProcessorEditor::addHandle(double sourceTime, double destinationTime)
 {
-    if (parameterID == "showSimilarityMatrix")
+    int newId = audioProcessor.addConstraint(sourceTime, destinationTime);
+    handles.push_back({newId, sourceTime, destinationTime});
+    
+    // Sort handles by destination time for correct processing order
+    std::sort(handles.begin(), handles.end(), [](const Handle& a, const Handle& b) {
+        return a.destinationTime < b.destinationTime;
+    });
+    
+    sourceOverviewComponent.setHandles(&handles);
+    timelineComponent.setHandles(&handles);
+    
+    repaint(); // Repaint editor for wires
+    sourceOverviewComponent.repaint();
+    timelineComponent.repaint();
+    }
+
+void DynamicMusicVstAudioProcessorEditor::moveHandle(int handleId, double newSourceTime, double newDestinationTime)
+{
+    for (auto& handle : handles)
     {
-        similarityMatrixDisplay.setVisible(newValue > 0.5f);
+        if (handle.id == handleId)
+        {
+            handle.sourceTime = newSourceTime;
+            handle.destinationTime = newDestinationTime;
+            break;
     }
 }
+
+    // Re-sort after moving
+    std::sort(handles.begin(), handles.end(), [](const Handle& a, const Handle& b) {
+        return a.destinationTime < b.destinationTime;
+    });
+    
+    // Pass updated handles to children for repaint
+    sourceOverviewComponent.setHandles(&handles);
+    timelineComponent.setHandles(&handles);
+    
+    // Calculate outdated range (between neighbors)
+    double startOutdated = 0.0;
+    double endOutdated = 100000.0; // Large value to cover end
+    
+    for (size_t i = 0; i < handles.size(); ++i)
+    {
+        if (handles[i].id == handleId)
+        {
+            if (i > 0)
+                startOutdated = handles[i-1].destinationTime;
+            
+            if (i < handles.size() - 1)
+                endOutdated = handles[i+1].destinationTime;
+            break;
+        }
+    }
+    
+    // Mark timeline as outdated since background retargeting is starting
+    timelineComponent.setOutdatedRange(juce::Range<double>(startOutdated, endOutdated));
+    
+    repaint();
+    sourceOverviewComponent.repaint();
+    timelineComponent.repaint();
+
+    // Trigger asynchronous call to PluginProcessor
+    audioProcessor.moveConstraint(handleId, newSourceTime, newDestinationTime);
+    }
+
+void DynamicMusicVstAudioProcessorEditor::deleteHandle(int handleId)
+{
+    // Remove handle from vector
+    handles.erase(
+        std::remove_if(handles.begin(), handles.end(),
+                      [handleId](const Handle& h) { return h.id == handleId; }),
+        handles.end()
+    );
+    
+    // Update components with new handles list
+    sourceOverviewComponent.setHandles(&handles);
+    timelineComponent.setHandles(&handles);
+    
+    // Mark entire timeline as outdated (full retarget)
+    timelineComponent.setOutdatedRange(juce::Range<double>(0.0, 100000.0));
+    
+    repaint();
+    sourceOverviewComponent.repaint();
+    timelineComponent.repaint();
+    
+    // Trigger asynchronous call to PluginProcessor
+    audioProcessor.removeConstraint(handleId);
+    }
+
 
 void DynamicMusicVstAudioProcessorEditor::changeListenerCallback(juce::ChangeBroadcaster *source)
 {
     if (source == &audioProcessor)
     {
-        // This is called when createRetargetedAudio finishes
-        similarityMatrixDisplay.setRetargetedMode(audioProcessor.isRetargeted.load());
-        waveformDisplay.repaint();
+        // This callback is now for both initial load and retarget completion
+        if (audioProcessor.isRetargeted.load())
+        {
+            // Update the timeline with the new audio
+            timelineComponent.updateManipulatedAudio(audioProcessor.getRetargetedAudioBuffer());
+            
+            // Update visual feedback for cuts and unused regions
+            auto cuts = audioProcessor.getCuts();
+            std::vector<TimelineComponent::CutInfo> timelineCuts;
+            for (const auto& cut : cuts)
+            {
+                timelineCuts.push_back({cut.targetTime, cut.sourceTimeFrom, cut.sourceTimeTo, cut.quality});
+            }
+            timelineComponent.setCuts(timelineCuts);
+            
+            auto unusedRegions = audioProcessor.getUnusedSourceRegions();
+            sourceOverviewComponent.setUnusedRegions(unusedRegions);
+        }
+        else
+        {
+            // Initial file load
+            const auto& buffer = audioProcessor.getAudioBuffer();
+            auto sampleRate = audioProcessor.getFileSampleRate();
+            sourceOverviewComponent.setSourceAudio(buffer, sampleRate);
+            timelineComponent.setSourceAudio(buffer, sampleRate);
+        }
     }
 }
 
 void DynamicMusicVstAudioProcessorEditor::resized()
 {
     auto bounds = getLocalBounds();
-    bounds.removeFromTop(25); // Make space for title
+    
+    auto controlsHeight = 40;
+    auto controlsBounds = bounds.removeFromTop(controlsHeight);
+    
+    juce::FlexBox flexBox;
+    flexBox.flexDirection = juce::FlexBox::Direction::column;
+    flexBox.items.add(juce::FlexItem(sourceOverviewComponent).withFlex(1.0f).withMargin(juce::FlexItem::Margin(0, 0, 20, 0))); // 20px bottom margin
+    flexBox.items.add(juce::FlexItem(timelineComponent).withFlex(1.0f).withMargin(juce::FlexItem::Margin(20, 0, 0, 0))); // 20px top margin
+    flexBox.performLayout(bounds);
 
-    auto usableBounds = bounds.reduced(10);
-
-    // --- Split main area into plots and controls ---
-    auto controlsWidth = 300;
-    auto plotsBounds = usableBounds.removeFromLeft(usableBounds.getWidth() - controlsWidth - 10);
-    auto controlsBounds = usableBounds.withLeft(plotsBounds.getRight() + 10);
-
-    // --- Layout Plots Column ---
-    juce::FlexBox plotsBox;
-    plotsBox.flexDirection = juce::FlexBox::Direction::column;
-    plotsBox.items.add(juce::FlexItem(similarityMatrixDisplay).withHeight(plotsBounds.getWidth()));
-    //plotsBox.items.add(juce::FlexItem(onsetEnvelopeDisplay).withHeight(120).withMargin(juce::FlexItem::Margin(5, 0, 0, 0)));
-    //plotsBox.items.add(juce::FlexItem(tempogramDisplay).withHeight(120).withMargin(juce::FlexItem::Margin(5, 0, 0, 0)));
-    plotsBox.items.add(juce::FlexItem(waveformDisplay).withHeight(80).withMargin(juce::FlexItem::Margin(5, 0, 0, 0)));
-    plotsBox.performLayout(plotsBounds);
-
-    // --- Layout Controls Column ---
     juce::FlexBox controlsBox;
-    controlsBox.flexDirection = juce::FlexBox::Direction::column;
+    controlsBox.flexDirection = juce::FlexBox::Direction::row;
+    controlsBox.justifyContent = juce::FlexBox::JustifyContent::flexStart;
+    controlsBox.alignItems = juce::FlexBox::AlignItems::center;
+    
+    controlsBox.items.add(juce::FlexItem(openFileButton).withWidth(120).withHeight(30).withMargin(5));
+    controlsBox.items.add(juce::FlexItem(playButton).withWidth(60).withHeight(30).withMargin(5));
+    controlsBox.items.add(juce::FlexItem(stopButton).withWidth(60).withHeight(30).withMargin(5));
+    controlsBox.items.add(juce::FlexItem(statusLabel).withFlex(1.0f).withHeight(30).withMargin(5));
 
-    // Buttons
-    juce::FlexBox buttonBox;
-    buttonBox.flexDirection = juce::FlexBox::Direction::row;
-    buttonBox.justifyContent = juce::FlexBox::JustifyContent::spaceAround;
-    buttonBox.alignItems = juce::FlexBox::AlignItems::center;
-    buttonBox.items.add(juce::FlexItem(openFileButton).withFlex(6.0f).withHeight(30));
-    buttonBox.items.add(juce::FlexItem(playButton).withFlex(3.0f).withHeight(30));
-    buttonBox.items.add(juce::FlexItem(stopButton).withFlex(3.0f).withHeight(30));
-    buttonBox.items.add(juce::FlexItem(analyzeButton).withFlex(4.0f).withHeight(30));
-    buttonBox.items.add(juce::FlexItem(retargetButton).withFlex(4.0f).withHeight(30));
-    controlsBox.items.add(juce::FlexItem(buttonBox).withHeight(50));
-
-    // Toggle
-    controlsBox.items.add(juce::FlexItem(showSimilarityMatrixButton).withHeight(30).withMargin(juce::FlexItem::Margin(10, 0, 10, 0)));
-
-    // Sliders
-    auto createSliderRow = [](juce::Label& label, juce::Slider& slider)
-    {
-        juce::FlexBox box;
-        box.flexDirection = juce::FlexBox::Direction::row;
-        box.items.add(juce::FlexItem(label).withFlex(1.0f).withMargin(juce::FlexItem::Margin(0, 10, 0, 0)));
-        box.items.add(juce::FlexItem(slider).withFlex(2.0f));
-        return box;
-    };
-    juce::FlexBox durationRow = createSliderRow(targetDurationLabel, targetDurationSlider);
-    juce::FlexBox tightnessRow = createSliderRow(beatTightnessLabel, beatTightnessSlider);
-    juce::FlexBox trimStartRow = createSliderRow(trimStartLabel, trimStartSlider);
-    juce::FlexBox trimEndRow = createSliderRow(trimEndLabel, trimEndSlider);
-    controlsBox.items.add(juce::FlexItem(durationRow).withFlex(1.0f));
-    controlsBox.items.add(juce::FlexItem(tightnessRow).withFlex(1.0f));
-    controlsBox.items.add(juce::FlexItem(trimStartRow).withFlex(1.0f));
-    controlsBox.items.add(juce::FlexItem(trimEndRow).withFlex(1.0f));
-
-    // Status
-    juce::FlexBox statusBox;
-    statusBox.flexDirection = juce::FlexBox::Direction::row;
-    statusBox.justifyContent = juce::FlexBox::JustifyContent::spaceAround;
-    statusBox.items.add(juce::FlexItem(statusLabel).withFlex(1.0f));
-    statusBox.items.add(juce::FlexItem(tempoLabel).withFlex(1.0f));
-    controlsBox.items.add(juce::FlexItem(statusBox).withFlex(0.5f));
-
-    controlsBox.performLayout(controlsBounds);
+    controlsBox.performLayout(controlsBounds.reduced(5));
 }
